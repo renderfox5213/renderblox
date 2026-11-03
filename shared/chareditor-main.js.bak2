@@ -1,0 +1,1494 @@
+// ============================================================
+// RenderBlox — Character Maker main module (clean rewrite)
+//
+// Design principles:
+//   - Attachments are ALWAYS attached to a head bone (or root fallback)
+//     BEFORE their .position/.scale are set. Local space only.
+//   - Hat button measures the head mesh and computes the right local
+//     offset so the hat sits on the head at the right size.
+//   - Selection: click bone in Bone mode, click attachment in viewport,
+//     or click attachment row in the list. Gizmo follows selection.
+//   - Save .rx6 serializes attachment meshes inline (no asset files
+//     needed for programmatic hats/boxes/text).
+// ============================================================
+
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { DecalGeometry } from 'three/addons/geometries/DecalGeometry.js';
+import {
+  initViewport, viewport, loadR6Template,
+  attachGizmoTo, detachGizmo,
+  updateCamHelper, resizeViewport, renderFrame, loadR6GirlTemplate
+} from './viewport.js';
+import {
+  sceneState,
+  getSelected,
+  setSelected,
+  addR6Character,
+  addModelFromRoot,
+  applyPreset,
+  R6_BONES,
+  findHeadMesh,
+  findHeadBone,
+  measureHead,
+  getMats,
+  setMeshColor,
+  setMeshMap,
+  clearMeshMap,
+  getMeshColorHex,
+  restoreHeadDefaultTexture, applyCharacterAppearance
+} from './scene.js';
+import {
+  assetStore, registerLoaders, saveRx6, loadRx6,
+  serializeAttachmentMesh, deserializeAttachmentMesh
+} from './zip-io.js';
+import {
+  toast, applySavedTheme, toggleTheme, isTypingInInput, escapeHtml, pushRecentFile
+} from './common.js';
+import { prettyMeshName } from './ui.js';
+import { faceDefs, faceName } from './faces.js';
+import {
+  faceHooks, ensureFaceTexture, facePreview, setFaceByKey, createFaceDecal, updateFaceDecal,
+  removeFaceDecal, myFaceAssetId, addUploadedFace, myFaceKeys, deleteMyFace
+} from './face-system.js';
+
+registerLoaders(THREE, GLTFLoader, OBJLoader);
+
+// ------------------------------------------------------------
+// State
+// ------------------------------------------------------------
+const cmState = {
+  boneEditMode: false,
+  selectedBone: null,
+  gizmoMode: 'translate',
+  history: { stack: [], index: -1, maxSize: 60 },
+  selectedAttachmentIndex: -1
+};
+
+// ------------------------------------------------------------
+// Head measurement helper — used by every attachment placement
+// ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// Attachment creation — every attachment goes through here
+// ------------------------------------------------------------
+function createTopHat() {
+  const obj = getSelected();
+  if (!obj) return null;
+
+  const hat = new THREE.Group();
+  hat.name = 'Top Hat';
+
+  const brim = new THREE.Mesh(
+    new THREE.CylinderGeometry(1, 1, 0.08, 24),
+                              new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.6 })
+  );
+  brim.name = 'Brim';
+
+  const crown = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.55, 0.6, 0.9, 24),
+                               new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.6 })
+  );
+  crown.name = 'Crown';
+  crown.position.y = 0.48;
+
+  const band = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.57, 0.57, 0.12, 24),
+                              new THREE.MeshStandardMaterial({ color: 0x8a1414, roughness: 0.5 })
+  );
+  band.name = 'Band';
+  band.position.y = 0.15;
+
+  hat.add(brim, crown, band);
+  hat.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+  const m = measureHead(obj);
+  m.attachTo.add(hat);
+  hat.position.set(0, m.localY, 0);
+  hat.scale.setScalar(m.scaleFactor);
+
+  return hat;
+}
+
+function createTextBox(text) {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const g = c.getContext('2d');
+  g.clearRect(0, 0, 512, 128);
+  g.fillStyle = '#ffffff';
+  g.strokeStyle = '#000000';
+  g.lineWidth = 6;
+  g.font = 'bold 80px Arial Black, sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.strokeText(text, 256, 64);
+  g.fillText(text, 256, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+
+  const plane = new THREE.Mesh(
+    new THREE.PlaneGeometry(2, 0.5),
+                               new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide })
+  );
+  plane.name = 'Text';
+  return plane;
+}
+
+function createBoxAttachment() {
+  const box = new THREE.Mesh(
+    new THREE.BoxGeometry(0.4, 0.4, 0.4),
+                             new THREE.MeshStandardMaterial({ color: 0x3b82f6, roughness: 0.6 })
+  );
+  box.name = 'Box';
+  box.castShadow = true;
+  box.receiveShadow = true;
+  return box;
+}
+
+// ------------------------------------------------------------
+// Attachments — add, select, delete
+// ------------------------------------------------------------
+function addAttachment(mesh, name) {
+  const obj = getSelected();
+  if (!obj || !mesh) return;
+
+  const m = measureHead(obj);
+  m.attachTo.add(mesh);
+  if (name === 'Top Hat') {
+    mesh.position.set(0, m.localY, 0);
+    mesh.scale.setScalar(m.scaleFactor);
+  } else {
+    // For text/box, place at head level, slightly forward
+    mesh.position.set(0, m.localY, 0.5);
+    mesh.scale.setScalar(m.scaleFactor);
+  }
+
+  obj.attachments.push({ name: name || mesh.name || 'Attachment', mesh, assetId: null });
+  cmState.selectedAttachmentIndex = obj.attachments.length - 1;
+  attachGizmo();
+  renderAttachments();
+  pushHistory(`Add ${name || 'Attachment'}`);
+  toast(`Added ${name || 'Attachment'}`);
+}
+
+function selectAttachment(index) {
+  const obj = getSelected();
+  if (!obj || index < 0 || index >= obj.attachments.length) return;
+  cmState.selectedAttachmentIndex = index;
+  cmState.selectedBone = null;
+  cmState.boneEditMode = false;
+  document.getElementById('btnBoneMode')?.classList.remove('on');
+  document.getElementById('viewport')?.classList.remove('bone');
+  document.getElementById('bone-banner')?.classList.remove('on');
+  const vBone = document.getElementById('vBone');
+  if (vBone) vBone.style.display = 'none';
+  attachGizmoTo(obj.attachments[index].mesh);
+  renderAttachments();
+  renderAppearance();
+  toast(`Selected: ${obj.attachments[index].name}`);
+}
+
+function deselectAttachment() {
+  cmState.selectedAttachmentIndex = -1;
+  attachGizmo();
+  renderAttachments();
+}
+
+function deleteAttachment(index) {
+  const obj = getSelected();
+  if (!obj) return;
+  const att = obj.attachments[index];
+  if (!att) return;
+  if (att.mesh && att.mesh.parent) att.mesh.parent.remove(att.mesh);
+  if (att.mesh) {
+    att.mesh.traverse(o => {
+      if (o.isMesh) {
+        try { o.geometry?.dispose?.(); } catch {}
+        getMats(o).forEach(mat => { try { mat.dispose?.(); } catch {} });
+      }
+    });
+  }
+  obj.attachments.splice(index, 1);
+  if (cmState.selectedAttachmentIndex === index) {
+    cmState.selectedAttachmentIndex = -1;
+    attachGizmo();
+  } else if (cmState.selectedAttachmentIndex > index) {
+    cmState.selectedAttachmentIndex--;
+  }
+  renderAttachments();
+  pushHistory('Remove Attachment');
+  toast('Attachment removed');
+}
+
+// ------------------------------------------------------------
+// Gizmo
+// ------------------------------------------------------------
+function attachGizmo() {
+  if (cmState.boneEditMode && cmState.selectedBone) {
+    if (viewport.transformGizmo.object !== cmState.selectedBone) {
+      attachGizmoTo(cmState.selectedBone);
+    }
+    return;
+  }
+  const obj = getSelected();
+  if (!obj) { detachGizmo(); return; }
+  if (cmState.selectedAttachmentIndex >= 0 && cmState.selectedAttachmentIndex < obj.attachments.length) {
+    const mesh = obj.attachments[cmState.selectedAttachmentIndex].mesh;
+    if (viewport.transformGizmo.object !== mesh) attachGizmoTo(mesh);
+    return;
+  }
+  if (obj.root.parent) {
+    if (viewport.transformGizmo.object !== obj.root) attachGizmoTo(obj.root);
+  } else {
+    detachGizmo();
+  }
+}
+
+function setGizmoMode(mode) {
+  cmState.gizmoMode = mode;
+  viewport.transformGizmo.setMode(mode);
+  document.getElementById('btnModeMove')?.classList.toggle('on', mode === 'translate');
+  document.getElementById('btnModeRotate')?.classList.toggle('on', mode === 'rotate');
+  document.getElementById('btnModeScale')?.classList.toggle('on', mode === 'scale');
+}
+
+// ------------------------------------------------------------
+// Bone mode
+// ------------------------------------------------------------
+function toggleBoneMode() {
+  cmState.boneEditMode = !cmState.boneEditMode;
+  document.getElementById('btnBoneMode')?.classList.toggle('on', cmState.boneEditMode);
+  document.getElementById('viewport')?.classList.toggle('bone', cmState.boneEditMode);
+  document.getElementById('bone-banner')?.classList.toggle('on', cmState.boneEditMode);
+  if (!cmState.boneEditMode) {
+    cmState.selectedBone = null;
+    const vBone = document.getElementById('vBone');
+    if (vBone) vBone.style.display = 'none';
+    setGizmoMode('translate');
+  } else {
+    cmState.selectedAttachmentIndex = -1;
+    setGizmoMode('rotate');
+    updateSkeletonOverlay();
+    toast('🦴 Bone mode — click a body part');
+  }
+  attachGizmo();
+  renderBones();
+}
+
+function selectBone(bone) {
+  cmState.selectedBone = bone;
+  cmState.selectedAttachmentIndex = -1;
+  cmState.boneEditMode = true;
+  const obj = getSelected();
+  if (obj) obj.__manualPose = true;
+  document.getElementById('btnBoneMode')?.classList.add('on');
+  document.getElementById('viewport')?.classList.add('bone');
+  document.getElementById('bone-banner')?.classList.add('on');
+  const vBone = document.getElementById('vBone');
+  if (vBone) vBone.style.display = '';
+  const vBoneName = document.getElementById('vBoneName');
+  if (vBoneName) vBoneName.textContent = bone.name;
+  viewport.transformGizmo.camera = viewport.activeCam;
+  viewport.transformGizmo.detach();
+  viewport.transformGizmo.attach(bone);
+  viewport.transformGizmo.setMode('rotate');
+  viewport.transformGizmo.visible = true;
+  setGizmoMode('rotate');
+  renderBones();
+  toast(`🦴 ${bone.name}`);
+}
+
+let skeletonOverlay = null;
+function updateSkeletonOverlay() {
+  const obj = getSelected();
+  const want = cmState.boneEditMode && obj && obj.type === 'r6';
+  if (!want) {
+    if (skeletonOverlay) { viewport.scene.remove(skeletonOverlay); skeletonOverlay = null; }
+    return;
+  }
+  const pts = [];
+  for (const n in obj.bones) {
+    const bone = obj.bones[n].obj;
+    if (bone.parent && bone.parent.isBone) {
+      const a = new THREE.Vector3(), b = new THREE.Vector3();
+      bone.getWorldPosition(a);
+      bone.parent.getWorldPosition(b);
+      pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
+    }
+  }
+  if (!skeletonOverlay) {
+    const mat = new THREE.LineBasicMaterial({ color: 0xffcc44, depthTest: false, transparent: true, opacity: 0.9 });
+    skeletonOverlay = new THREE.LineSegments(new THREE.BufferGeometry(), mat);
+    skeletonOverlay.renderOrder = 999;
+    skeletonOverlay.frustumCulled = false;
+    viewport.scene.add(skeletonOverlay);
+  }
+  skeletonOverlay.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+  skeletonOverlay.geometry.attributes.position.needsUpdate = true;
+}
+
+function pickBone(mouseX, mouseY) {
+  const obj = getSelected();
+  if (!obj || obj.type !== 'r6') return null;
+  const rect = viewport.renderer.domElement.getBoundingClientRect();
+  const ndc = new THREE.Vector2(
+    ((mouseX - rect.left) / rect.width) * 2 - 1,
+                                -((mouseY - rect.top) / rect.height) * 2 + 1
+  );
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(ndc, viewport.activeCam);
+  const hits = raycaster.intersectObject(obj.root, true);
+  if (!hits.length) return null;
+  const hit = hits[0].point;
+  let best = null, bd = Infinity;
+  for (const n in obj.bones) {
+    const bw = new THREE.Vector3();
+    obj.bones[n].obj.getWorldPosition(bw);
+    const d = bw.distanceToSquared(hit);
+    if (d < bd) { bd = d; best = obj.bones[n].obj; }
+  }
+  return best;
+}
+
+// ------------------------------------------------------------
+// Face decal — shared face system (see face-system.js)
+// ------------------------------------------------------------
+sceneState.createFaceDecal = createFaceDecal;
+sceneState.updateFaceDecal = updateFaceDecal;
+sceneState.setFaceByKey = (obj, key, settings) => setFaceByKey(obj, key, settings);
+sceneState.ensureFaceTexture = ensureFaceTexture;
+faceHooks.onFaceReady = () => renderFaceSection();
+sceneState.findHeadBone = findHeadBone;
+
+// ------------------------------------------------------------
+// Camera helpers
+// ------------------------------------------------------------
+function fitCamera() {
+  const obj = getSelected();
+  if (!obj) return;
+  const box = new THREE.Box3().setFromObject(obj.root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const d = Math.max(size.x, size.y, size.z) * 2.2;
+  viewport.editorCam.position.set(center.x + d * 0.35, center.y + size.y * 0.15, center.z + d);
+  viewport.controls.target.copy(center);
+  viewport.controls.update();
+}
+
+// ------------------------------------------------------------
+// UI rendering
+// ------------------------------------------------------------
+function updateEmptyState() {
+  const empty = document.getElementById('cm-empty');
+  if (!empty) return;
+  if (sceneState.objects.length === 0) empty.classList.remove('hide');
+  else empty.classList.add('hide');
+}
+
+function updateVStats() {
+  const obj = getSelected();
+  const vSel = document.getElementById('vSel');
+  const vParts = document.getElementById('vParts');
+  if (vSel) vSel.textContent = obj ? obj.name : '—';
+  if (vParts) vParts.textContent = obj ? (obj.meshes?.length || 0) : 0;
+  const timeDisplay = document.getElementById('timeDisplay');
+  if (timeDisplay) timeDisplay.textContent = obj ? obj.name : '—';
+}
+function renderAppearance() {
+  const el = document.getElementById('appearanceList');
+  const countEl = document.getElementById('cm-meshes-count');
+  if (!el) return;
+  const obj = getSelected();
+  if (!obj) {
+    el.innerHTML = '<div class="tool-hint">No character loaded.</div>';
+    if (countEl) countEl.textContent = '0 parts';
+    return;
+  }
+
+  let html = '';
+  if (obj.type === 'r6') {
+    const hidden = obj.hiddenParts || [];
+    const colors = obj.partColors || {};
+    const partsList = [
+      { id: 'head', label: 'Head' },
+      { id: 'torso', label: 'Torso' },
+      { id: 'left_arm', label: 'Left Arm' },
+      { id: 'right_arm', label: 'Right Arm' },
+      { id: 'left_leg', label: 'Left Leg' },
+      { id: 'right_leg', label: 'Right Leg' }
+    ];
+
+    html += `<div class="section"><div class="section-title">Body Parts</div>
+    <div style="display:flex;flex-direction:column;gap:6px">`;
+    
+    partsList.forEach(p => {
+      const isVisible = !hidden.includes(p.id);
+      const color = colors[p.id] || '#a3a3a3';
+      
+      // Don't show hide checkbox for torso
+      const hideCheckbox = p.id === 'torso' 
+        ? `<span style="width:16px;display:inline-block"></span>` 
+        : `<input type="checkbox" data-hide-part="${p.id}" ${isVisible ? 'checked' : ''}>`;
+
+      html += `<div class="part-color-row">
+        <label>
+          ${hideCheckbox}
+          <span>${p.label}</span>
+        </label>
+        <input type="color" data-color-part="${p.id}" value="${color}">
+      </div>`;
+    });
+
+    html += `</div>
+    <div class="tool-hint" style="margin-top:8px">Uncheck to amputate. Click the color box to paint specifically that limb.</div>
+    </div>`;
+  } else {
+    // Fallback for non-R6 objects
+    const meshes = obj.meshes || [];
+    html += `<div class="section"><div class="section-title">Parts <span class="badge">${meshes.length}</span></div>
+    <div class="mesh-list" id="meshList">`;
+    meshes.forEach((m, i) => {
+      html += `<div class="mesh-row ${i === obj.selectedMeshIndex ? 'sel' : ''}">
+        <span class="mesh-name">${escapeHtml(prettyMeshName(m.name))}</span>
+      </div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  html += `<div class="section"><div class="section-title">Base Color</div>
+    <div class="slider-row">
+      <input type="color" id="paintColor" value="#ffffff" style="flex:1;height:28px;border:1px solid var(--border);background:transparent;border-radius:6px;cursor:pointer">
+      <button class="mini-btn green" id="resetPaintBtn" style="padding:6px 12px">Reset All</button>
+    </div>
+    <div class="color-swatch-row" id="swatchRow"></div>
+  </div>`;
+
+  el.innerHTML = html;
+
+  // --- Listeners ---
+  document.querySelectorAll('input[data-hide-part]').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      const hiddenSet = new Set(obj.hiddenParts || []);
+      if (e.target.checked) hiddenSet.delete(e.target.dataset.hidePart);
+      else hiddenSet.add(e.target.dataset.hidePart);
+      obj.hiddenParts = [...hiddenSet];
+      
+      // Single call recompiles the shader with both hide and color logic
+      applyCharacterAppearance(obj, obj.hiddenParts, obj.partColors || {});
+      
+      pushHistory('Amputate Part');
+    });
+  });
+
+  document.querySelectorAll('input[data-color-part]').forEach(inp => {
+    inp.addEventListener('input', (e) => {
+      if (!obj.partColors) obj.partColors = {};
+      obj.partColors[e.target.dataset.colorPart] = e.target.value;
+      applyCharacterAppearance(obj, obj.hiddenParts || [], obj.partColors);
+    });
+    inp.addEventListener('change', () => {
+      pushHistory('Paint Part');
+    });
+  });
+
+  document.getElementById('resetPaintBtn')?.addEventListener('click', () => {
+    obj.partColors = {};
+    applyCharacterAppearance(obj, obj.hiddenParts || [], {});
+    renderAppearance();
+    pushHistory('Reset Colors');
+  });
+
+  // Swatches for base paint
+  const sw = document.getElementById('swatchRow');
+  if (sw) {
+    const palette = ['#ff5566','#3b82f6','#22c55e','#fbbf24','#a855f7','#ff6b35',
+    '#ffffff','#000000','#8b5a2b','#10b981','#f43f5e','#eab308'];
+    palette.forEach(c => {
+      const el2 = document.createElement('div');
+      el2.className = 'color-swatch';
+      el2.style.background = c;
+      el2.title = c;
+      el2.addEventListener('click', () => {
+        // Apply to all meshes as base color
+        obj.meshes.forEach(m => {
+          getMats(m.mesh).forEach(mat => { mat.color.set(c); });
+        });
+        pushHistory('Base Paint');
+      });
+      sw.appendChild(el2);
+    });
+  }
+}
+
+function renderFaceSection() {
+  const el = document.getElementById('faceSection');
+  if (!el) return;
+  const obj = getSelected();
+  if (!obj || obj.type !== 'r6') {
+    el.innerHTML = '<div class="tool-hint" style="margin:0">Faces work on the R6 character.</div>';
+    return;
+  }
+  const cur = obj.faceKey || 'default';
+  const ud = obj.faceDecal?.userData;
+  let html = `<div class="tool-hint" style="margin:0 0 8px 0">Current: <b>${escapeHtml(faceName(cur))}</b> — picking a face wipes the old face texture first.</div>
+  <div class="face-grid" id="faceGrid"></div>
+  <div class="mini-grid">
+    <button class="mini-btn" id="faceRandBtn">🎲 Random</button>
+    <button class="mini-btn" id="faceBlankBtn">◌ Blank</button>
+    <button class="mini-btn" id="faceDefaultBtn">↺ Default</button>
+    <button class="mini-btn green" id="faceUploadBtn">📥 Upload</button>
+  </div>`;
+
+  if (obj.faceDecal && ud) {
+    const row = (id, label, min, max, step, v) => `<div class="slider-row"><label>${label}</label>
+      <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${v}"><span class="val" id="${id}v">${v.toFixed(2)}</span></div>`;
+    html += `<div style="margin-top:10px">${row('faceScale', 'Size', 0.3, 2.5, 0.05, ud.scale ?? 1.6)}
+      ${row('faceX', 'X', -1, 1, 0.01, ud.xOff ?? 0)}${row('faceY', 'Y', -1, 1, 0.01, ud.yOff ?? 0.6)}${row('faceZ', 'Wrap', 0.2, 1, 0.02, ud.zOff ?? 0.6)}</div>`;
+  }
+  el.innerHTML = html;
+
+  const apply = async (key, label) => {
+    await ensureFaceTexture(key);
+    setFaceByKey(obj, key);
+    pushHistory('Face: ' + label);
+    renderFaceSection();
+  };
+  const grid = document.getElementById('faceGrid');
+
+  const tiles = [...faceDefs().map(d => ({ key: d.key, name: d.name })), ...myFaceKeys().map(f => ({ my: f.idx, name: f.name, data: f.data }))];
+  tiles.forEach(t => {
+    const tile = document.createElement('div');
+    tile.className = 'face-tile' + (t.key && t.key === cur ? ' on' : '');
+    tile.title = t.name;
+    tile.innerHTML = `<div class="fn">${escapeHtml(t.name)}</div>`;
+    if (t.my != null) tile.style.backgroundImage = `url('${t.data}')`;
+    else facePreview(t.key).then(u => { if (u && tile.isConnected) tile.style.backgroundImage = `url('${u}')`; });
+    tile.addEventListener('click', () => apply(t.my != null ? 'asset:' + myFaceAssetId(t.my) : t.key, t.name));
+    if (t.my != null) tile.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      if (confirm(`Delete custom face "${t.name}"?`)) { deleteMyFace(t.my); renderFaceSection(); }
+    });
+    grid.appendChild(tile);
+  }
+);
+
+  document.querySelectorAll('select[data-layer]').forEach(sel => {
+    sel.addEventListener('change', (e) => {
+      const layerKey = e.target.dataset.layer;
+      const list = FACE_LAYERS[layerKey] || [];
+      const selected = list.find(l => l.id === e.target.value) || null;
+      
+      // Update state
+      import('./faces.js').then(m => {
+        m.LAYERED_FACE[layerKey] = selected;
+        // Force the engine to redraw the decal
+        setFaceByKey(obj, 'lib:layered');
+        pushHistory('Customize Face');
+        renderFaceSection();
+      });
+    });
+  });
+
+  document.getElementById('faceRandBtn')?.addEventListener('click', () => {
+    const pool = faceDefs().filter(d => d.key !== obj.faceKey);
+    const p = pool[Math.floor(Math.random() * pool.length)];
+    if (p) apply(p.key, p.name);
+  });
+  document.getElementById('faceBlankBtn')?.addEventListener('click', () => {
+    setFaceByKey(obj, 'none'); pushHistory('Blank Face'); renderFaceSection(); toast('Face cleared');
+  });
+  document.getElementById('faceDefaultBtn')?.addEventListener('click', () => {
+    setFaceByKey(obj, 'default'); pushHistory('Default Face'); renderFaceSection(); toast('Default face restored');
+  });
+  document.getElementById('faceUploadBtn')?.addEventListener('click', () => {
+    const inp = document.getElementById('fileInputFace');
+    if (!inp) return;
+    inp.value = '';
+    inp.click();
+  });
+  if (obj.faceDecal) {
+    [['faceScale', 'scale'], ['faceX', 'xOff'], ['faceY', 'yOff'], ['faceZ', 'zOff']].forEach(([id, prop]) => {
+      const inp = document.getElementById(id);
+      inp?.addEventListener('input', () => {
+        const v = parseFloat(inp.value);
+        obj.faceDecal.userData[prop] = v;
+        document.getElementById(id + 'v').textContent = v.toFixed(2);
+        updateFaceDecal(obj);
+      });
+      inp?.addEventListener('change', () => pushHistory('Face ' + prop));
+    });
+  }
+}
+
+function renderAttachments() {
+  const el = document.getElementById('attList');
+  if (!el) return;
+  const obj = getSelected();
+  if (!obj) { el.innerHTML = ''; return; }
+  if (!obj.attachments || obj.attachments.length === 0) {
+    el.innerHTML = '<div class="tool-hint" style="margin:0">No attachments yet.</div>';
+    return;
+  }
+  el.innerHTML = '';
+  obj.attachments.forEach((att, i) => {
+    const isSel = i === cmState.selectedAttachmentIndex;
+    const item = document.createElement('div');
+    item.className = 'attach-item';
+    if (isSel) item.style.outline = '2px solid var(--accent)';
+    item.innerHTML = `<span class="name">${escapeHtml(att.name)}</span><button class="del">✕</button>`;
+    item.addEventListener('click', (e) => {
+      if (e.target.classList.contains('del')) return;
+      selectAttachment(i);
+    });
+    item.querySelector('.del').addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteAttachment(i);
+    });
+    el.appendChild(item);
+  });
+}
+
+function renderBones() {
+  const el = document.getElementById('boneList');
+  const countEl = document.getElementById('cm-bones-count');
+  if (!el) return;
+  const obj = getSelected();
+  if (!obj || obj.type !== 'r6') {
+    el.innerHTML = '<div class="tool-hint" style="padding:8px">No character loaded.</div>';
+    if (countEl) countEl.textContent = '0 bones';
+    return;
+  }
+  const boneNames = Object.keys(obj.bones);
+  if (countEl) countEl.textContent = `${boneNames.length} bones`;
+  if (boneNames.length === 0) {
+    el.innerHTML = '<div class="tool-hint" style="padding:8px">No bones detected.</div>';
+    return;
+  }
+  const ordered = [];
+  for (const n of R6_BONES) if (boneNames.includes(n)) ordered.push(n);
+  for (const n of boneNames) if (!ordered.includes(n)) ordered.push(n);
+  el.innerHTML = '';
+  ordered.forEach(n => {
+    const isSel = cmState.selectedBone && cmState.selectedBone.name === n;
+    const b = obj.bones[n].obj;
+    const rx = THREE.MathUtils.radToDeg(b.rotation.x).toFixed(0);
+    const ry = THREE.MathUtils.radToDeg(b.rotation.y).toFixed(0);
+    const rz = THREE.MathUtils.radToDeg(b.rotation.z).toFixed(0);
+    const row = document.createElement('div');
+    row.className = 'bone-row' + (isSel ? ' sel' : '');
+    row.innerHTML = `<span class="dot"></span><span class="n">${escapeHtml(n)}</span>
+    <span class="r">${rx}° ${ry}° ${rz}°</span>`;
+    row.addEventListener('click', () => selectBone(b));
+    el.appendChild(row);
+  });
+}
+
+// ------------------------------------------------------------
+// History
+// ------------------------------------------------------------
+function snapshotScene() {
+  const obj = getSelected();
+  if (!obj) return null;
+  return {
+    objId: obj.id,
+    currentAction: obj.currentAction,
+    selectedMeshIndex: obj.selectedMeshIndex,
+    faceKey: obj.faceKey || null,
+    meshes: (obj.meshes || []).map(m => {
+      const mats = getMats(m.mesh);
+      return {
+        name: m.name,
+        visible: m.mesh.visible,
+        color: mats[0]?.color ? [mats[0].color.r, mats[0].color.g, mats[0].color.b] : null,
+        textureAssetId: m.mesh.userData.textureAssetId || null
+      };
+    }),
+    bones: Object.fromEntries(Object.keys(obj.bones).map(n => {
+      const b = obj.bones[n].obj;
+      return [n, { q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w], p: [b.position.x, b.position.y, b.position.z] }];
+    })),
+    attachments: (obj.attachments || []).map(a => {
+      const entry = { name: a.name, assetId: a.assetId || null };
+      if (a.mesh) entry.transform = {
+        p: [a.mesh.position.x, a.mesh.position.y, a.mesh.position.z],
+        q: [a.mesh.quaternion.x, a.mesh.quaternion.y, a.mesh.quaternion.z, a.mesh.quaternion.w],
+        s: [a.mesh.scale.x, a.mesh.scale.y, a.mesh.scale.z]
+      };
+      if (!a.assetId && a.mesh) {
+        try { entry.inline = serializeAttachmentMesh(a.mesh, obj.root); } catch (e) {}
+      }
+      return entry;
+    })
+  };
+}
+
+function pushHistory(label) {
+  const h = cmState.history;
+  const snap = snapshotScene();
+  if (!snap) return;
+  h.stack = h.stack.slice(0, h.index + 1);
+  h.stack.push({ label, snap });
+  h.index = h.stack.length - 1;
+  if (h.stack.length > h.maxSize) { h.stack.shift(); h.index--; }
+  updateHistoryButtons();
+}
+
+function restoreSnapshot(snap) {
+  if (!snap) return;
+  const obj = getSelected();
+  if (!obj || obj.id !== snap.objId) return;
+  obj.currentAction = snap.currentAction;
+  obj.selectedMeshIndex = snap.selectedMeshIndex;
+  if (obj.type === 'r6' && (obj.faceKey || null) !== (snap.faceKey || null)) setFaceByKey(obj, snap.faceKey || 'default');
+  if (snap.meshes && obj.meshes) {
+    snap.meshes.forEach((ms, i) => {
+      const m = obj.meshes[i];
+      if (!m) return;
+      m.mesh.visible = ms.visible !== false;
+      if (ms.color) getMats(m.mesh).forEach(mat => { if (mat.color) mat.color.setRGB(...ms.color); });
+    });
+  }
+  if (snap.bones) {
+    for (const n in snap.bones) {
+      const e = obj.bones[n];
+      if (!e) continue;
+      const d = snap.bones[n];
+      e.obj.quaternion.set(d.q[0], d.q[1], d.q[2], d.q[3]);
+      e.obj.position.set(d.p[0], d.p[1], d.p[2]);
+    }
+  }
+  // ---- restore attachments ----
+  if (Array.isArray(snap.attachments)) {
+    (obj.attachments || []).forEach(a => { if (a.mesh && a.mesh.parent) a.mesh.parent.remove(a.mesh); });
+    obj.attachments = [];
+    const headBone = findHeadBone(obj) || obj.root;
+    for (const ad of snap.attachments) {
+      let root = null;
+      if (ad.inline) {
+        try { root = deserializeAttachmentMesh(THREE, ad.inline); } catch (e) { console.warn('attachment restore failed', e); }
+      }
+      if (root) {
+        headBone.add(root);
+        obj.attachments.push({ name: ad.name, mesh: root, assetId: ad.assetId });
+      } else if (ad.assetId) {
+        console.warn('[history] cannot restore GLB attachment from snapshot:', ad.name);
+      }
+    }
+    cmState.selectedAttachmentIndex = -1;
+    attachGizmo();
+    renderAttachments();
+  }
+  renderAppearance();
+  renderBones();
+  renderFaceSection();
+}
+
+function undo() {
+  const h = cmState.history;
+  if (h.index <= 0) return toast('Nothing to undo');
+  h.index--;
+  restoreSnapshot(h.stack[h.index].snap);
+  updateHistoryButtons();
+  toast('↶ Undo');
+}
+
+function redo() {
+  const h = cmState.history;
+  if (h.index >= h.stack.length - 1) return toast('Nothing to redo');
+  h.index++;
+  restoreSnapshot(h.stack[h.index].snap);
+  updateHistoryButtons();
+  toast('↷ Redo');
+}
+
+function updateHistoryButtons() {
+  const h = cmState.history;
+  const undoBtn = document.getElementById('btnUndo');
+  const redoBtn = document.getElementById('btnRedo');
+  if (undoBtn) undoBtn.disabled = h.index <= 0;
+  if (redoBtn) redoBtn.disabled = h.index >= h.stack.length - 1;
+}
+
+// ------------------------------------------------------------
+// Boot
+// ------------------------------------------------------------
+function boot() {
+  applySavedTheme();
+
+  const viewportEl = document.getElementById('viewport');
+  initViewport(viewportEl);
+
+  const { scene, editorCam, sceneCam, controls, transformGizmo } = viewport;
+  window.__renderbloxScene = scene;
+  window.__renderbloxSceneCam = sceneCam;
+  window.__renderbloxEditorCam = editorCam;
+
+  sceneState.getR6Template = () => viewport.r6Template;
+  window.__renderbloxLoadGirlTemplate = loadR6GirlTemplate;
+  sceneState.onObjectAdded = (obj) => {
+    if (obj && obj.root && !obj.root.parent) scene.add(obj.root);
+  };
+    sceneState.onObjectRemoved = (obj) => {
+      if (obj && obj.root) {
+        if (obj.root.parent) scene.remove(obj.root);
+        disposeObject3D(obj.root);
+      }
+    };
+      sceneState.onChanged = () => { updateEmptyState(); updateVStats(); };
+      sceneState.onSelectionChanged = () => {
+        const obj = getSelected();
+        const vSel = document.getElementById('vSel');
+        if (vSel) vSel.textContent = obj ? obj.name : '—';
+        cmState.selectedAttachmentIndex = -1;
+        renderAppearance();
+        renderBones();
+        renderFaceSection();
+        renderAttachments();
+        attachGizmo();
+      };
+
+      transformGizmo.addEventListener('dragging-changed', (e) => {
+        controls.enabled = !e.value;
+        if (!e.value) pushHistory('Transform');
+      });
+
+        viewport.onR6LoadOk = () => {
+          const statusEl = document.getElementById('status-overlay');
+          if (statusEl) statusEl.classList.add('hide');
+          console.log('[CharEditor] R6 template loaded');
+        };
+        viewport.onR6LoadError = (err) => {
+          const statusEl = document.getElementById('status-overlay');
+          if (statusEl) statusEl.classList.add('hide');
+          showModelError(err);
+        };
+        viewport.onCameraChange = () => {};
+
+        initMenuBar();
+        wireTopbar();
+        wireRightPanel();
+        wireFileInputs();
+        wireKeyboard();
+        wireViewportEvents();
+        wireResize();
+        wireEmptyState();
+
+        updateEmptyState();
+        renderAppearance();
+        renderBones();
+        renderFaceSection();
+        renderAttachments();
+
+        startRenderLoop();
+}
+
+function wireEmptyState() {
+  document.getElementById('cm-empty-new')?.addEventListener('click', promptNewCharacter);
+}
+
+function disposeObject3D(root) {
+  if (!root) return;
+  root.traverse(o => {
+    if (o.isMesh) {
+      try { o.geometry?.dispose?.(); } catch {}
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      mats.forEach(m => {
+        if (!m) return;
+        for (const k of ['map','normalMap','emissiveMap','metalnessMap','roughnessMap','alphaMap','aoMap','lightMap','envMap']) {
+          try { m[k]?.dispose?.(); } catch {}
+        }
+        try { m.dispose?.(); } catch {}
+      });
+    }
+  });
+}
+
+
+async function promptNewCharacter() {
+  const back = document.getElementById('char-gender-backdrop');
+  if (!back) { createNewCharacter('male'); return; }
+
+  back.style.display = 'flex';
+  
+  const cleanup = () => {
+    back.style.display = 'none';
+    document.getElementById('btn-gender-male').onclick = null;
+    document.getElementById('btn-gender-female').onclick = null;
+    document.getElementById('btn-gender-cancel').onclick = null;
+  };
+
+  document.getElementById('btn-gender-male').onclick = () => {
+    cleanup();
+    createNewCharacter('male');
+  };
+
+  document.getElementById('btn-gender-female').onclick = async () => {
+    cleanup();
+    toast('Loading female model…');
+    try {
+      const tpl = await loadR6GirlTemplate();
+      if (!tpl) throw new Error('Failed to load female model');
+      window.__renderbloxSceneGirlTemplate = tpl;
+      createNewCharacter('female');
+    } catch (err) {
+      console.error(err);
+      toast('❌ Could not load female model: ' + err.message);
+    }
+  };
+
+  document.getElementById('btn-gender-cancel').onclick = () => cleanup();
+}
+
+function createNewCharacter(gender = 'male') {
+  if (!viewport.r6Template) { toast('Waiting for r6.glb to load…'); return; }
+  sceneState.objects.forEach(o => {
+    viewport.scene.remove(o.root);
+    disposeObject3D(o.root);
+  });
+  sceneState.objects = [];
+  const obj = addR6Character(gender === 'female' ? 'Girl' : 'R6', gender);
+  setSelected(obj.id);
+  pushHistory('New Character');
+  fitCamera();
+  toast('🎭 Character created');
+}
+
+async function doSaveRx6() {
+  const obj = getSelected();
+  if (!obj) return toast('No character to save');
+  try {
+    const result = await saveRx6();
+    pushRecentFile({ name: result.filename, type: 'rx6', size: 0 });
+    toast(`💾 Saved ${result.filename}`);
+  } catch (err) {
+    console.error(err);
+    toast(`❌ Save failed: ${err.message}`);
+  }
+}
+
+// ------------------------------------------------------------
+// Topbar
+// ------------------------------------------------------------
+function wireTopbar() {
+  document.getElementById('btnAddR6')?.addEventListener('click', promptNewCharacter);
+  document.getElementById('btnImportRx6')?.addEventListener('click', () => {
+    const inp = document.getElementById('fileInputRx6');
+    if (inp) { inp.value = ''; inp.click(); }
+  });
+  document.getElementById('btnImportModel')?.addEventListener('click', () => {
+    const inp = document.getElementById('fileInputModel');
+    if (inp) { inp.value = ''; inp.click(); }
+  });
+  document.getElementById('btnModeMove')?.addEventListener('click', () => setGizmoMode('translate'));
+  document.getElementById('btnModeRotate')?.addEventListener('click', () => setGizmoMode('rotate'));
+  document.getElementById('btnModeScale')?.addEventListener('click', () => setGizmoMode('scale'));
+  document.getElementById('btnBoneMode')?.addEventListener('click', toggleBoneMode);
+  document.getElementById('btnSaveRx6')?.addEventListener('click', doSaveRx6);
+  document.getElementById('cmSaveBtn')?.addEventListener('click', doSaveRx6);
+  document.getElementById('btnUndo')?.addEventListener('click', undo);
+  document.getElementById('btnRedo')?.addEventListener('click', redo);
+  document.getElementById('btnTheme')?.addEventListener('click', () => {
+    const isDark = toggleTheme();
+    const btn = document.getElementById('btnTheme');
+    if (btn) btn.textContent = isDark ? '☀️' : '🌙';
+  });
+    if (document.body.classList.contains('dark')) {
+      const btn = document.getElementById('btnTheme');
+      if (btn) btn.textContent = '☀️';
+    }
+}
+
+// ------------------------------------------------------------
+// Right panel
+// ------------------------------------------------------------
+function wireRightPanel() {
+  document.querySelectorAll('#presetGrid .preset-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const obj = getSelected();
+      if (!obj) return;
+      obj.currentAction = btn.dataset.preset;
+      obj.__manualPose = false;
+      document.querySelectorAll('#presetGrid .preset-btn').forEach(b => {
+        b.classList.toggle('on', b.dataset.preset === obj.currentAction);
+      });
+      pushHistory('Preset');
+    });
+  });
+
+  document.getElementById('attHatBtn')?.addEventListener('click', () => {
+    const hat = createTopHat();
+    if (hat) addAttachment(hat, 'Top Hat');
+  });
+
+    document.getElementById('attImportBtn')?.addEventListener('click', () => {
+      const inp = document.getElementById('fileInputAttach');
+      if (inp) { inp.value = ''; inp.click(); }
+    });
+
+    document.getElementById('attTextBtn')?.addEventListener('click', () => {
+      const txt = prompt('Text:', 'HELLO');
+      if (!txt) return;
+      const plane = createTextBox(txt);
+      addAttachment(plane, `Text: ${txt.slice(0, 12)}`);
+    });
+
+    document.getElementById('attPrimBtn')?.addEventListener('click', () => {
+      const box = createBoxAttachment();
+      addAttachment(box, 'Small Box');
+    });
+
+    document.getElementById('bnReset')?.addEventListener('click', () => {
+      const obj = getSelected();
+      if (!obj) return;
+      for (const n in obj.bones) {
+        const e = obj.bones[n];
+        e.obj.quaternion.copy(e.restQuat);
+        e.obj.position.copy(e.restPos);
+      }
+      renderBones();
+      pushHistory('Reset Bones');
+    });
+}
+
+// ------------------------------------------------------------
+// File inputs
+// ------------------------------------------------------------
+function wireFileInputs() {
+  document.getElementById('fileInputAttach')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+    const obj = getSelected();
+    if (!obj) return;
+    try {
+      const root = await loadModelRootFromFile(file);
+      if (!root) { toast('Failed to load attachment'); return; }
+
+      // Normalize size to ~0.5 world units
+      const box = new THREE.Box3().setFromObject(root);
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      if (maxDim > 0.001) root.scale.setScalar(0.5 / maxDim);
+
+      root.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+
+      // Attach to head bone or root
+      const m = measureHead(obj);
+      m.attachTo.add(root);
+      root.position.set(0, m.localY, 0.5);
+
+      const assetId = assetStore.register(
+        file.name.match(/\.obj$/i) ? 'obj' : 'glb',
+                                          file.name,
+                                          await file.arrayBuffer()
+      );
+      obj.attachments.push({ name: file.name, mesh: root, assetId });
+      cmState.selectedAttachmentIndex = obj.attachments.length - 1;
+      attachGizmo();
+      renderAttachments();
+      pushHistory('Import Attachment');
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`);
+    }
+  });
+
+  document.getElementById('fileInputTexture')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const inp = e.target;
+    const meshIdx = parseInt(inp.dataset.meshIdx || '-1');
+    const texType = inp.dataset.texType || 'base';
+    inp.value = '';
+
+    const obj = getSelected();
+    if (!obj || meshIdx < 0 || meshIdx >= obj.meshes.length) return;
+
+    try {
+      const bytes = await file.arrayBuffer();
+      const assetId = assetStore.register('texture', file.name, bytes);
+      const tex = await loadTextureFromArrayBuffer(bytes);
+      if (!tex) { toast('Could not read texture'); return; }
+
+      const mesh = obj.meshes[meshIdx].mesh;
+      if (texType === 'overlay') {
+        getMats(mesh).forEach(mat => { mat.map = tex; mat.transparent = true; mat.needsUpdate = true; });
+        toast(`Overlay applied to ${prettyMeshName(obj.meshes[meshIdx].name)}`);
+      } else {
+        setMeshMap(mesh, tex);
+        getMats(mesh).forEach(mat => { mat.transparent = false; mat.needsUpdate = true; });
+        toast(`Base texture applied to ${prettyMeshName(obj.meshes[meshIdx].name)}`);
+      }
+      mesh.userData.textureAssetId = assetId;
+      pushHistory('Apply Texture');
+      renderAppearance();
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`);
+    }
+  });
+
+  document.getElementById('fileInputFace')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+    const obj = getSelected();
+    if (!obj || obj.type !== 'r6') return;
+    try {
+      const key = await addUploadedFace(file);
+      if (!key) { toast('Could not read image'); return; }
+      await ensureFaceTexture(key);
+      setFaceByKey(obj, key);
+      pushHistory('Face');
+      renderFaceSection();
+      toast('Face applied · saved to My Faces');
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`);
+    }
+  });
+
+  document.getElementById('fileInputModel')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+    try {
+      const root = await loadModelRootFromFile(file);
+      if (!root) { toast('Failed to load model'); return; }
+
+      sceneState.objects.forEach(o => viewport.scene.remove(o.root));
+      sceneState.objects = [];
+
+      root.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(root);
+      const h = box.getSize(new THREE.Vector3()).y;
+      if (h > 30 || h < 0.3) root.scale.setScalar(5 / h);
+      root.updateMatrixWorld(true);
+      const box2 = new THREE.Box3().setFromObject(root);
+      const c = box2.getCenter(new THREE.Vector3());
+      root.position.set(-c.x, -box2.min.y, -c.z);
+
+      const assetId = assetStore.register(
+        file.name.match(/\.obj$/i) ? 'obj' : 'glb',
+                                          file.name,
+                                          await file.arrayBuffer()
+      );
+      const hasBones = !!root.getObjectByProperty('isBone', true);
+      let obj;
+      if (hasBones) {
+        const { buildCharacter } = await import('./scene.js');
+        obj = buildCharacter(root, file.name.replace(/\.[^.]+$/, ''));
+        obj.assetId = assetId;
+      } else {
+        obj = addModelFromRoot(root, file.name.replace(/\.[^.]+$/, ''), assetId);
+      }
+      setSelected(obj.id);
+      fitCamera();
+      pushHistory('Import Model');
+      toast(`📦 Imported "${obj.name}"`);
+    } catch (err) {
+      console.error(err);
+      toast(`❌ Import failed: ${err.message}`);
+    }
+  });
+
+  document.getElementById('fileInputRx6')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = '';
+    try {
+      const statusEl = document.getElementById('status-overlay');
+      if (statusEl) { statusEl.textContent = `Loading ${file.name}…`; statusEl.classList.remove('hide'); }
+      sceneState.objects.forEach(o => viewport.scene.remove(o.root));
+      sceneState.objects = [];
+      const result = await loadRx6(file);
+      if (statusEl) statusEl.classList.add('hide');
+      if (result && result.obj) {
+        setSelected(result.obj.id);
+        fitCamera();
+        pushHistory('Load .rx6');
+        toast(`📂 Loaded ${file.name}`);
+      } else {
+        toast('⚠ .rx6 loaded but no character found');
+      }
+    } catch (err) {
+      console.error(err);
+      toast(`❌ ${err.message}`);
+      const statusEl = document.getElementById('status-overlay');
+      if (statusEl) statusEl.classList.add('hide');
+    }
+  });
+}
+
+async function loadModelRootFromFile(file) {
+  return new Promise((resolve) => {
+    const isOBJ = file.name.match(/\.obj$/i);
+    const url = URL.createObjectURL(file);
+    if (isOBJ) {
+      new OBJLoader().load(url, (root) => { URL.revokeObjectURL(url); resolve(root); }, undefined, () => { URL.revokeObjectURL(url); resolve(null); });
+    } else {
+      new GLTFLoader().load(url, (g) => { URL.revokeObjectURL(url); resolve(g.scene); }, undefined, () => { URL.revokeObjectURL(url); resolve(null); });
+    }
+  });
+}
+
+async function loadTextureFromArrayBuffer(bytes) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(new Blob([bytes]));
+    const img = new Image();
+    img.onload = () => {
+      const tex = new THREE.Texture(img);
+      tex.needsUpdate = true;
+      tex.colorSpace = THREE.SRGBColorSpace;
+      URL.revokeObjectURL(url);
+      resolve(tex);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+// ------------------------------------------------------------
+// Keyboard
+// ------------------------------------------------------------
+function wireKeyboard() {
+  addEventListener('keydown', (e) => {
+    if (isTypingInInput()) return;
+    const mod = e.ctrlKey || e.metaKey;
+
+    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); doSaveRx6(); return; }
+    if (mod && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return; }
+    if (mod && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) { e.preventDefault(); redo(); return; }
+    if (e.key.toLowerCase() === 'b') { e.preventDefault(); toggleBoneMode(); return; }
+    if (e.key.toLowerCase() === 'g') { setGizmoMode('translate'); return; }
+    if (e.key.toLowerCase() === 'r') { setGizmoMode('rotate'); return; }
+    if (e.key.toLowerCase() === 's' && !mod) { setGizmoMode('scale'); return; }
+    if (e.key.toLowerCase() === 'f') { fitCamera(); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (cmState.selectedAttachmentIndex >= 0) deleteAttachment(cmState.selectedAttachmentIndex);
+      return;
+    }
+    if (e.key === 'Escape') {
+      if (cmState.boneEditMode) { toggleBoneMode(); return; }
+      if (cmState.selectedAttachmentIndex >= 0) { deselectAttachment(); return; }
+    }
+    if (['1','2','3','4','5','6'].includes(e.key)) {
+      const order = ['idle', 'wave', 'point', 'walk', 'dance', 'rest'];
+      const obj = getSelected();
+      if (obj) {
+        obj.currentAction = order[parseInt(e.key) - 1];
+        obj.__manualPose = false;
+        document.querySelectorAll('#presetGrid .preset-btn').forEach(b => {
+          b.classList.toggle('on', b.dataset.preset === obj.currentAction);
+        });
+      }
+    }
+  });
+}
+
+// ------------------------------------------------------------
+// Viewport events
+// ------------------------------------------------------------
+function wireViewportEvents() {
+  const el = viewport.renderer.domElement;
+  el.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    if (viewport.transformGizmo.axis || viewport.transformGizmo.dragging) return;
+    if (cmState.boneEditMode) {
+      const bone = pickBone(e.clientX, e.clientY);
+      if (bone) { selectBone(bone); return; }
+    }
+    const rect = el.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+                                  -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    const raycaster = new THREE.Raycaster();
+    raycaster.setFromCamera(ndc, viewport.activeCam);
+    const obj = getSelected();
+    if (obj && obj.attachments && obj.attachments.length > 0) {
+      const meshes = obj.attachments.map(a => a.mesh);
+      const hits = raycaster.intersectObjects(meshes, true);
+      if (hits.length > 0) {
+        let target = hits[0].object;
+        while (target && !meshes.includes(target)) target = target.parent;
+        const idx = meshes.indexOf(target);
+        if (idx >= 0) { selectAttachment(idx); return; }
+      }
+    }
+    if (cmState.selectedAttachmentIndex >= 0) deselectAttachment();
+  });
+}
+
+function wireResize() {
+  addEventListener('resize', () => { resizeViewport(); });
+}
+
+// ------------------------------------------------------------
+// Menu bar
+// ------------------------------------------------------------
+function initMenuBar() {
+  const menubarEl = document.getElementById('menubar');
+  if (!menubarEl) return;
+  let openEl = null, openDd = null;
+
+  const close = () => {
+    if (openEl) openEl.classList.remove('open');
+    if (openDd && openDd.parentNode) openDd.parentNode.removeChild(openDd);
+    openEl = null; openDd = null;
+  };
+
+  const menus = {
+    file: [
+      { label: 'New Character', fn: createNewCharacter },
+      { label: 'Import .rx6…', fn: () => { const i = document.getElementById('fileInputRx6'); if (i) { i.value = ''; i.click(); } } },
+      { label: 'Import Model…', fn: () => { const i = document.getElementById('fileInputModel'); if (i) { i.value = ''; i.click(); } } },
+      { label: 'Save .rx6…', shortcut: 'Ctrl+S', fn: doSaveRx6 },
+      { sep: true },
+      { label: 'Back to Home', fn: () => location.href = 'index.html' }
+    ],
+    edit: [
+      { label: 'Undo', shortcut: 'Ctrl+Z', fn: undo, disabled: () => cmState.history.index <= 0 },
+      { label: 'Redo', shortcut: 'Ctrl+Y', fn: redo, disabled: () => cmState.history.index >= cmState.history.stack.length - 1 },
+      { sep: true },
+      { label: 'Delete Selected Attachment', fn: () => { if (cmState.selectedAttachmentIndex >= 0) deleteAttachment(cmState.selectedAttachmentIndex); } },
+      { label: 'Reset All Bones', fn: () => document.getElementById('bnReset')?.click() }
+    ],
+    view: [
+      { label: 'Fit to Character', shortcut: 'F', fn: fitCamera },
+      { sep: true },
+      { label: 'Toggle Dark Mode', fn: () => { const isDark = toggleTheme(); const btn = document.getElementById('btnTheme'); if (btn) btn.textContent = isDark ? '☀️' : '🌙'; } }
+    ],
+    character: [
+      { label: 'Add R6', fn: createNewCharacter },
+      { sep: true },
+      { label: 'Toggle Bone Mode', shortcut: 'B', fn: toggleBoneMode },
+      { sep: true },
+      { header: 'Pose Presets' },
+      { label: '😀 Idle', fn: () => setPreset('idle') },
+      { label: '👋 Wave', fn: () => setPreset('wave') },
+      { label: '👉 Point', fn: () => setPreset('point') },
+      { label: '🚶 Walk', fn: () => setPreset('walk') },
+      { label: '🕺 Dance', fn: () => setPreset('dance') },
+      { label: '🧍 Rest', fn: () => setPreset('rest') }
+    ],
+    help: [{ label: 'About', fn: () => alert('RenderBlox Character Maker v1.0.0') }]
+  };
+
+  menubarEl.querySelectorAll('.menu-item').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const key = el.dataset.menu;
+      if (openEl === el) { close(); return; }
+      close();
+      el.classList.add('open');
+      openEl = el;
+      const items = menus[key] || [];
+      const dd = document.createElement('div');
+      dd.className = 'menu-dropdown';
+      items.forEach(item => {
+        if (item.sep) { const s = document.createElement('div'); s.className = 'menu-sep'; dd.appendChild(s); return; }
+        if (item.header) { const h = document.createElement('div'); h.className = 'menu-header'; h.textContent = item.header; dd.appendChild(h); return; }
+        const row = document.createElement('div');
+        row.className = 'menu-row';
+        if (item.disabled && item.disabled()) row.classList.add('disabled');
+        row.innerHTML = `<span class="menu-left">${item.label}</span>${item.shortcut ? `<span class="menu-shortcut">${item.shortcut}</span>` : ''}`;
+        row.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (item.disabled && item.disabled()) return;
+          close();
+          try { item.fn(); } catch (err) { console.error(err); }
+        });
+        dd.appendChild(row);
+      });
+      document.body.appendChild(dd);
+      const r = el.getBoundingClientRect();
+      dd.style.left = r.left + 'px';
+      dd.style.top = (r.bottom + 3) + 'px';
+      dd.classList.add('show');
+      openDd = dd;
+    });
+  });
+
+  document.addEventListener('click', (e) => {
+    if (openDd && !openDd.contains(e.target) && !menubarEl.contains(e.target)) close();
+  });
+}
+
+function setPreset(name) {
+  const obj = getSelected();
+  if (!obj) return;
+  obj.currentAction = name;
+  obj.__manualPose = false;
+  document.querySelectorAll('#presetGrid .preset-btn').forEach(b => {
+    b.classList.toggle('on', b.dataset.preset === name);
+  });
+  pushHistory('Preset');
+}
+
+// ------------------------------------------------------------
+// Model error
+// ------------------------------------------------------------
+function showModelError(err) {
+  const overlay = document.getElementById('model-error-overlay');
+  if (!overlay) { toast(`❌ ${err.hint || err.message}`); return; }
+  const details = document.getElementById('model-error-details');
+  const hint = document.getElementById('model-error-hint');
+  if (details) {
+    details.innerHTML = `
+    <div><b>Type:</b> <span class="val">${escapeHtml(err.type || 'unknown')}</span></div>
+    <div><b>URL:</b> <span class="val">${escapeHtml(err.url || 'models/r6.glb')}</span></div>
+    ${err.status ? `<div><b>HTTP Status:</b> <span class="val">${err.status}</span></div>` : ''}
+    <div><b>Message:</b> <span class="val">${escapeHtml(err.message || 'Unknown')}</span></div>
+    `;
+  }
+  if (hint) hint.textContent = err.hint || '';
+  overlay.classList.add('on');
+  document.getElementById('model-error-retry')?.addEventListener('click', () => {
+    overlay.classList.remove('on');
+    loadR6Template();
+  });
+  document.getElementById('model-error-dismiss')?.addEventListener('click', () => {
+    overlay.classList.remove('on');
+  });
+}
+
+// ------------------------------------------------------------
+// Render loop
+// ------------------------------------------------------------
+const clock = new THREE.Clock();
+let fpsAcc = 0, fpsFrames = 0;
+
+function startRenderLoop() {
+  function tick() {
+    requestAnimationFrame(tick);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    fpsAcc += dt; fpsFrames++;
+    if (fpsAcc >= 0.5) {
+      const fps = Math.round(fpsFrames / fpsAcc);
+      const fpsEl = document.getElementById('fpsDisplay');
+      const perfFps = document.getElementById('perfFps');
+      const perfMs = document.getElementById('perfMs');
+      const perfCalls = document.getElementById('perfCalls');
+      if (fpsEl) fpsEl.textContent = fps;
+      if (perfFps) perfFps.textContent = fps;
+      if (perfMs) perfMs.textContent = (1000 / Math.max(1, fps)).toFixed(1);
+      if (perfCalls) perfCalls.textContent = viewport.renderer.info.render.calls;
+      fpsAcc = 0; fpsFrames = 0;
+    }
+    const obj = getSelected();
+    if (obj && obj.type === 'r6' && !obj.__manualPose && !cmState.boneEditMode) {
+      applyPreset(obj, obj.currentAction, 0);
+    }
+    if (cmState.boneEditMode) updateSkeletonOverlay();
+    renderFrame(dt);
+  }
+  tick();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', boot);
+} else {
+  boot();
+}

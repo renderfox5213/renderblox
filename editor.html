@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>RenderBlox — Scene Editor</title>
+<link rel="stylesheet" href="shared/style.css" />
+<link rel="stylesheet" href="shared/editor.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- Menu bar -->
+  <div id="menubar">
+    <div class="menu-item" data-menu="file">File</div>
+    <div class="menu-item" data-menu="edit">Edit</div>
+    <div class="menu-item" data-menu="view">View</div>
+    <div class="menu-item" data-menu="character">Character</div>
+    <div class="menu-item" data-menu="camera">Camera</div>
+    <div class="menu-item" data-menu="help">Help</div>
+  </div>
+
+  <!-- Top toolbar -->
+  <div id="topbar">
+    <div class="logo">RenderBlox<span>v1.0.0</span></div>
+    <button class="tb-btn primary" id="btnAddR6"><span class="ico">🎭</span>Add R6</button>
+    <button class="tb-btn" id="btnImport"><span class="ico">📥</span>Import</button>
+<button class="tb-btn" id="btnImportRx6"><span class="ico">🎭</span>Import .rx6</button>
+    <button class="tb-btn" id="btnAddLight"><span class="ico">💡</span>Light</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn on" id="btnModeMove"><span class="ico">✥</span>Move</button>
+    <button class="tb-btn" id="btnModeRotate"><span class="ico">↻</span>Rotate</button>
+    <button class="tb-btn" id="btnModeScale"><span class="ico">⤢</span>Scale</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn" id="btnBoneMode" title="Bone mode (B)"><span class="ico">🦴</span>Bone</button>
+    <button class="tb-btn" id="btnFPV"><span class="ico">🎥</span>FPV</button>
+    <button class="tb-btn" id="btnCamKey"><span class="ico">◈</span>Cam Key</button>
+    <button class="tb-btn" id="btnCamPreview"><span class="ico">👁</span>Preview</button>
+    <button class="tb-btn on" id="btnFrame" title="Frame guide — outlines what the exported video will contain (O)"><span class="ico">▭</span>Frame</button>
+    <select class="tb-select" id="frameSel" title="Frame guide / export aspect">
+      <option value="match">Match export</option>
+      <option value="shorts">Shorts 9:16</option>
+      <option value="youtube">YouTube 16:9</option>
+      <option value="square">Square 1:1</option>
+      <option value="portrait">Portrait 4:5</option>
+    </select>
+    <button class="tb-btn" id="btnLookKey" title="Add colour/face key at playhead (J)"><span class="ico">◉</span>Look Key</button>
+    <button class="tb-btn" id="btnAutoKey" title="Auto-key: edits write keys at the playhead"><span class="ico">⏺</span>Auto</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn" id="btnUndo" disabled><span class="ico">↶</span>Undo</button>
+    <button class="tb-btn" id="btnRedo" disabled><span class="ico">↷</span>Redo</button>
+
+    <div class="tb-spacer"></div>
+
+    <button class="tb-btn export" id="btnExport"><span class="ico">📹</span>Export Video</button>
+    <button class="tb-btn" id="btnSettings" title="Export Settings"><span class="ico">⚙</span></button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn" id="btnSave"><span class="ico">💾</span>Save</button>
+    <button class="tb-btn" id="btnLoad"><span class="ico">📂</span>Load</button>
+    <button class="tb-btn" id="btnTheme" title="Toggle theme">🌙</button>
+  </div>
+
+  <!-- Left panel -->
+  <div id="leftpanel">
+    <div class="section">
+      <div class="section-title">Scene <span class="badge" id="objCount">0</span></div>
+      <div id="sceneList"><em style="color:var(--dim-2);font-size:12px">No objects yet.</em></div>
+      <div class="mini-grid" style="margin-top:8px">
+        <button class="mini-btn" id="btnSelectAll">Cycle</button>
+        <button class="mini-btn red" id="btnClearAll">Clear</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Add Shape</div>
+      <div class="prim-grid">
+        <button class="prim-btn" data-prim="box">Box</button>
+        <button class="prim-btn" data-prim="sphere">Sphere</button>
+        <button class="prim-btn" data-prim="cylinder">Cylinder</button>
+        <button class="prim-btn" data-prim="cone">Cone</button>
+        <button class="prim-btn" data-prim="plane">Plane</button>
+        <button class="prim-btn" data-prim="torus">Torus</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">World Lighting</div>
+      <div class="slider-row"><label>Sun</label><input type="range" id="worldInt" min="0" max="3" step="0.05" value="1.15"><span class="val" id="worldIntv">1.15</span></div>
+      <div class="slider-row"><label>Color</label><input type="color" id="worldColor" value="#fff2d6" style="flex:1;height:26px;border:1px solid var(--border);background:transparent;border-radius:6px;cursor:pointer"></div>
+      <div class="slider-row"><label>Amb</label><input type="range" id="ambInt" min="0" max="2" step="0.05" value="0.45"><span class="val" id="ambIntv">0.45</span></div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Views</div>
+      <div class="cam-grid">
+        <button class="cam-btn" data-cam="front">Front</button>
+        <button class="cam-btn" data-cam="side">Side</button>
+        <button class="cam-btn" data-cam="threeq">3/4</button>
+        <button class="cam-btn" data-cam="top">Top</button>
+        <button class="cam-btn" data-cam="fit" style="grid-column:1/-1">Fit to Scene</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Quality</div>
+      <div class="chips" id="qualityChips">
+        <div class="chip" data-q="low">Low</div>
+        <div class="chip" data-q="medium">Medium</div>
+        <div class="chip on" data-q="high">High</div>
+        <div class="chip" data-q="ultra">Ultra</div>
+      </div>
+      <div class="tool-hint">Lower = better FPS. Ultra = max visual quality.</div>
+    </div>
+  </div>
+
+  <!-- Viewport -->
+  <div id="viewport">
+    <div id="viewport-overlay">
+      <div>Selected: <b id="vSel">—</b></div>
+      <div>Time: <span class="val" id="vTime">0.00s</span></div>
+      <div>View: <span class="val" id="vMode">Editor</span></div>
+      <div id="vBone" style="display:none">Bone: <span class="warn" id="vBoneName">—</span></div>
+    </div>
+    <div id="r6-hud">
+      <div class="hdr" id="r6-hud-name">R6</div>
+      <div>POS <span class="v" id="r6-hud-pos">—</span></div>
+      <div>ROT <span class="v" id="r6-hud-rot">—</span></div>
+      <div>SCL <span class="v" id="r6-hud-scl">—</span></div>
+      <div>ACT <span class="v" id="r6-hud-act">—</span></div>
+      <div>KEY <span class="v" id="r6-hud-key">—</span></div>
+    </div>
+    <div id="fpv-keys-hud">
+      <div><span class="k">WASD</span> fly · <span class="k">Q/E</span> down/up · <span class="k">Wheel</span> altitude · <span class="k">Shift</span> boost</div>
+      <div id="fpv-keys-extra" style="display:none"><span class="k">K</span> drop camera key at current view</div>
+      <div style="color:#ff9c9c;margin-top:2px">All editor shortcuts disabled while in FPV</div>
+    </div>
+    <div id="perf-bar">FPS <b id="perfFps">—</b> · <b id="perfMs">—</b> ms · calls <b id="perfCalls">—</b></div>
+    <div id="crosshair"></div>
+    <div id="fpv-banner">FPV MODE · WASD + Scroll to fly · Click to lock mouse</div>
+    <div id="bone-banner">🦴 BONE MODE · Click a body part · Gizmo rotates it</div>
+    <div id="rec-badge"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#fff;margin-right:6px;animation:recPulse 1s infinite"></span>RECORDING</div>
+    <div id="toast"></div>
+    <div id="status-overlay">Loading models/r6.glb…</div>
+
+    <!-- Model load error overlay -->
+    <div id="model-error-overlay">
+      <div class="model-error-box">
+        <h3>⚠ Could not load the R6 model</h3>
+        <p>The editor can't create new R6 characters without <code>models/r6.glb</code>.
+           Everything else — panels, timeline, save/load — still works.</p>
+        <div class="details" id="model-error-details"></div>
+        <div class="hint" id="model-error-hint"></div>
+        <div class="btns">
+          <button class="btn" id="model-error-dismiss">Dismiss</button>
+          <button class="btn primary" id="model-error-retry">Retry</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export progress -->
+    <div id="progress-overlay">
+      <div class="po-box">
+        <div class="po-title" id="po-title">📹 Rendering frames…</div>
+        <div class="po-bar"><div id="po-fill"></div></div>
+        <div class="po-sub" id="po-sub">Preparing…</div>
+        <div class="po-tip" id="po-tip"><span class="em">✨</span><span id="po-tip-text">Getting things ready…</span></div>
+        <button id="po-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right panel -->
+  <div id="rightpanel">
+    <div class="tabs">
+      <button class="tab on" data-tab="props">Props</button>
+      <button class="tab appear" data-tab="appear">Appearance</button>
+      <button class="tab cam" data-tab="camera">Camera</button>
+      <button class="tab bone" data-tab="bones">Bones</button>
+    </div>
+    <div id="propContent"></div>
+    <div id="appearContent" style="display:none"></div>
+    <div id="camContent" style="display:none"></div>
+    <div id="boneContent" style="display:none"></div>
+  </div>
+
+  <!-- Timeline -->
+  <div id="timeline-wrap">
+    <div id="timeline-header">
+      <div><b>Timeline</b></div>
+      <div class="info">
+        <div>Duration: <span id="hDur">10.0s</span></div>
+        <div>Keys: <span id="hKeys">0</span></div>
+        <div>Cam: <span class="cam" id="hCamKeys">0</span></div>
+        <div>Bone: <span class="bone" id="hBoneKeys">—</span></div>
+        <div>Look: <span style="color:#ec4899" id="hLookKeys">0</span></div>
+      </div>
+    </div>
+    <div id="timeline">
+      <div id="timeline-ruler"></div>
+      <div id="timeline-tracks"></div>
+      <div id="snap-line"></div>
+      <div id="playhead"></div>
+    </div>
+  </div>
+
+  <!-- Bottom transport -->
+  <div id="bottombar">
+    <div class="transport">
+      <button id="btnJumpStart" title="Home">⏮</button>
+      <button id="btnStepBack" title="←">⏪</button>
+      <button id="btnPlay" class="play" title="Space">▶</button>
+      <button id="btnStepFwd" title="→">⏩</button>
+      <button id="btnJumpEnd" title="End">⏭</button>
+      <button id="btnLoop" title="Loop (L)">🔁</button>
+    </div>
+    <div class="info">
+      <div><label>TIME</label><input type="number" id="timeDisplay" value="0.00" step="0.01" style="width:70px;padding:4px;background:var(--panel-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-family:inherit;font-size:12px;text-align:center">s</div>
+      <div><label>FPS</label><span id="fpsDisplay">60</span></div>
+      <div><label>SPD</label><input type="range" id="speedSlider" min="0.25" max="2" step="0.05" value="1"><span id="speedLabel">1.00×</span></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="info">
+      <label>Duration</label>
+      <input type="number" id="duration-input" min="1" max="300" step="0.5" value="10">
+      <label>sec</label>
+    </div>
+  </div>
+</div>
+
+<!-- Import modal -->
+<div id="import-backdrop">
+  <div id="import-modal">
+    <h3>📥 Import "<span id="impName">model.glb</span>"</h3>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:12px">Choose how RenderBlox should treat this file.</div>
+    <div class="imp-options">
+      <button class="imp-opt" data-mode="model">
+        <span class="em">📦</span><b>Static Model</b>
+        <small>Geometry + materials only. Move, scale, paint — but no posing.</small>
+      </button>
+      <button class="imp-opt" data-mode="character">
+        <span class="em">🎭</span><b>Character (rigged)</b>
+        <small>Uses the skeleton so it can be posed &amp; baked like R6.</small>
+      </button>
+    </div>
+    <div class="btns"><button id="impCancel">Cancel</button></div>
+  </div>
+</div>
+
+<!-- Walk duration modal -->
+<div id="walkdur-backdrop">
+  <div id="walkdur-modal">
+    <h3>🚶 Walk Duration</h3>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:14px">How many seconds should this walk take?</div>
+    <input type="number" id="walkdur-input" min="0.5" max="60" step="0.5" value="2.0" autofocus>
+    <div class="btns">
+      <button id="walkdur-cancel">Cancel</button>
+      <button class="primary" id="walkdur-ok">Bake Walk</button>
+    </div>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div id="settings-backdrop">
+  <div id="settings">
+    <h3>📹 Export Settings</h3>
+    <div class="row">
+      <label>Export Mode</label>
+      <div class="exp-modes">
+        <button class="exp-mode on" id="expModeAccurate" data-mode="accurate">
+          <span class="em">🎬</span>
+          <b>Accurate</b>
+          <small>Renders frame-by-frame. Same output on every machine, but slower.</small>
+        </button>
+        <button class="exp-mode" id="expModeQuick" data-mode="quick">
+          <span class="em">⚡</span>
+          <b>Quick</b>
+          <small>Real-time screen capture. Takes exactly the clip length, may drop frames.</small>
+        </button>
+      </div>
+    </div>
+    <div class="row"><label>Resolution</label>
+      <select id="expRes">
+        <option value="1280x720">1280 × 720 (HD)</option>
+        <option value="1920x1080" selected>1920 × 1080 (Full HD)</option>
+        <option value="2560x1440">2560 × 1440 (2K)</option>
+        <option value="1080x1920">1080 × 1920 (Shorts / TikTok 9:16)</option>
+        <option value="720x1280">720 × 1280 (Shorts 9:16, lighter)</option>
+        <option value="1080x1080">1080 × 1080 (Square)</option>
+        <option value="1080x1350">1080 × 1350 (Portrait 4:5)</option>
+        <option value="3840x2160">3840 × 2160 (4K)</option>
+        <option value="854x480">854 × 480 (SD)</option>
+        <option value="640x360">640 × 360 (Tiny)</option>
+      </select></div>
+    <div class="row"><label>Frame Rate</label>
+      <select id="expFps">
+        <option value="15">15 FPS</option><option value="24">24 FPS</option>
+        <option value="30" selected>30 FPS</option><option value="60">60 FPS</option>
+      </select></div>
+    <div class="row"><label>Format</label>
+      <select id="expFormat">
+        <option value="mp4" selected>MP4 (H.264 — recommended)</option>
+        <option value="webm-vp9">WebM (VP9)</option>
+        <option value="webm-vp8">WebM (VP8)</option>
+      </select>
+      <div class="info">MP4 records WebM first, then converts via Mediabunny using hardware acceleration.</div>
+    </div>
+    <div class="row"><label>Bitrate Quality</label>
+      <select id="expBitrate">
+        <option value="4000000">4 Mbps</option>
+        <option value="8000000" selected>8 Mbps</option>
+        <option value="16000000">16 Mbps</option>
+        <option value="25000000">25 Mbps</option>
+      </select></div>
+    <div class="row"><label>Graphics Quality (1-10)</label>
+      <input type="range" id="expQuality" min="1" max="10" step="1" value="8" style="width:100%">
+      <div class="info">1 = No lighting, no shadows (fastest). 10 = Max bloom, 4K shadows (prettiest).</div>
+    </div>
+    <div class="row" id="accurateOnlyOpts"><label>Speed Boosts (Accurate mode)</label>
+      <label class="check"><input type="checkbox" id="expNoBloom" checked>Disable bloom during export</label>
+      <label class="check" style="margin-top:6px"><input type="checkbox" id="expSmallShadow" checked>1024px shadow map during export</label>
+    </div>
+    <div class="btns"><button id="btnSettingsCancel">Cancel</button><button class="primary" id="btnSettingsSave">Save</button></div>
+  </div>
+</div>
+
+<!-- Help modal -->
+<div id="help-backdrop">
+  <div id="help-modal">
+    <h3>⌨ Keyboard Shortcuts</h3>
+    <table>
+      <tr><td class="group" colspan="2">Animate</td></tr>
+      <tr><td><kbd>B</kbd></td><td>Bone mode</td></tr>
+      <tr><td><kbd>K</kbd></td><td>Add keyframe</td></tr>
+      <tr><td><kbd>D</kbd></td><td>Delete key at playhead</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>V</kbd></td><td>Copy / paste keyframe</td></tr>
+      <tr><td><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></td><td>Key interp: Linear / Ease / Step</td></tr>
+      <tr><td><kbd>J</kbd></td><td>Add look key (colour / opacity / face)</td></tr>
+      <tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Delete look key at playhead</td></tr>
+      <tr><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
+      <tr><td><kbd>L</kbd></td><td>Toggle loop</td></tr>
+      <tr><td><kbd>←</kbd><kbd>→</kbd></td><td>Step frame (Shift = 0.5s)</td></tr>
+      <tr><td class="group" colspan="2">View & Gizmo</td></tr>
+      <tr><td><kbd>G</kbd><kbd>R</kbd><kbd>S</kbd></td><td>Move / Rotate / Scale</td></tr>
+      <tr><td><kbd>F</kbd></td><td>FPV mode</td></tr>
+      <tr><td><kbd>C</kbd></td><td>Add camera key</td></tr>
+      <tr><td><kbd>Q</kbd><kbd>W</kbd><kbd>E</kbd><kbd>T</kbd></td><td>Front / Side / ¾ / Top view</td></tr>
+      <tr><td><kbd>Z</kbd></td><td>Focus selected object</td></tr>
+      <tr><td><kbd>O</kbd></td><td>Toggle frame guide (Shorts / YouTube outline)</td></tr>
+      <tr><td class="group" colspan="2">Files</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd>/<kbd>O</kbd></td><td>Save / Open .rdbx</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>E</kbd></td><td>Export video</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd>/<kbd>Y</kbd></td><td>Undo / Redo</td></tr>
+      <tr><td><kbd>Ctrl</kbd>+<kbd>D</kbd></td><td>Duplicate</td></tr>
+      <tr><td><kbd>Delete</kbd></td><td>Delete object</td></tr>
+      <tr><td class="group" colspan="2">In FPV / Export</td></tr>
+      <tr><td>FPV</td><td>All shortcuts disabled. Only <kbd>Esc</kbd> (leave) and <kbd>K</kbd> in walk-setup work.</td></tr>
+      <tr><td>Export</td><td>Only <kbd>Esc</kbd> works — it cancels the export.</td></tr>
+    </table>
+    <div class="btns" style="display:flex;justify-content:flex-end;margin-top:16px">
+      <button id="helpClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Hidden file inputs -->
+<input type="file" id="fileInput" accept=".glb,.gltf,.obj">
+<input type="file" id="fileInputAttach" accept=".glb,.gltf,.obj">
+<input type="file" id="fileInputTexture" accept="image/*">
+<input type="file" id="fileInputFace" accept="image/*">
+<input type="file" id="fileInputRdbx" accept=".rdbx">
+<input type="file" id="fileInputRx6" accept=".rx6">
+<input type="file" id="fileInputModel" accept=".glb,.gltf,.obj">
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "jszip": "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm",
+    "mediabunny": "https://cdn.jsdelivr.net/npm/mediabunny@1/+esm"
+  }
+}
+</script>
+
+<script type="module" src="shared/editor-main.js"></script>
+
+
+<!-- Character Gender Modal -->
+<div id="char-gender-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)">
+  <div style="background:var(--panel);border-radius:14px;padding:26px 28px;box-shadow:var(--shadow-lg);min-width:300px;text-align:center">
+    <h3 style="font-size:15px;font-weight:800;margin-bottom:18px">Choose Character</h3>
+    <div style="display:flex;gap:12px;justify-content:center;margin-bottom:22px">
+      <button class="btn" id="btn-gender-male" style="padding:20px;font-size:24px;flex:1" title="Male R6">♂</button>
+      <button class="btn" id="btn-gender-female" style="padding:20px;font-size:24px;flex:1" title="Female R6">♀</button>
+    </div>
+    <button class="btn" id="btn-gender-cancel" style="width:100%">Cancel</button>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>RenderBlox</title>
+<link rel="stylesheet" href="shared/style.css" />
+<style>
+  /* Landing-page-only styles */
+  body{
+    display:flex;flex-direction:column;
+    align-items:center;
+    justify-content:flex-start;
+    min-height:100vh;
+    padding:32px 24px 48px;
+    background:radial-gradient(ellipse at top, var(--panel) 0%, var(--bg) 60%);
+    overflow-y:auto;
+  }
+  body.dark{
+    background:radial-gradient(ellipse at top, var(--panel-2) 0%, var(--bg) 70%);
+  }
+  .landing{
+    max-width:1100px;width:100%;
+    display:flex;flex-direction:column;gap:32px;
+    margin:0 auto;
+  }
+  .header{display:flex;align-items:center;justify-content:space-between;
+    padding-top:4px}
+  .brand{display:flex;align-items:baseline;gap:10px}
+  .brand h1{
+    font-size:34px;font-weight:900;letter-spacing:-.03em;
+    color:var(--accent);
+  }
+  .brand .tag{
+    font-size:11px;font-weight:700;color:var(--dim);
+    letter-spacing:.08em;text-transform:uppercase;
+    padding:3px 9px;border-radius:999px;background:var(--panel-2);
+    border:1px solid var(--border);
+  }
+  .tagline{font-size:15px;color:var(--dim);line-height:1.6;max-width:640px;margin-top:8px}
+  .tagline code{
+    background:var(--panel-2);padding:1px 6px;border-radius:4px;
+    font-family:'Consolas','Monaco',monospace;font-size:12.5px;color:var(--text)
+  }
+
+  .top-actions{display:flex;gap:8px}
+
+  /* Drop zone */
+  .drop-zone{
+    background:var(--panel);border:2px dashed var(--border);
+    border-radius:16px;padding:34px 28px;
+    display:flex;flex-direction:column;align-items:center;gap:12px;
+    text-align:center;transition:all .15s;cursor:pointer;
+    position:relative;
+  }
+  .drop-zone:hover{
+    border-color:var(--accent-2);background:var(--hover);
+  }
+  .drop-zone.dragover{
+    border-color:var(--accent-2);background:rgba(59,130,246,.08);
+    border-style:solid;transform:scale(1.01);
+  }
+  .drop-zone .em{
+    font-size:40px;line-height:1;margin-bottom:4px;
+    transition:transform .2s;
+  }
+  .drop-zone.dragover .em{
+    transform:translateY(-4px) scale(1.1);
+  }
+  .drop-zone h2{
+    font-size:17px;font-weight:800;letter-spacing:-.01em;
+  }
+  .drop-zone p{
+    font-size:12.5px;color:var(--dim);line-height:1.6;max-width:420px;
+  }
+  .drop-zone .formats{
+    display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;justify-content:center;
+  }
+  .drop-zone .format-pill{
+    font-size:10.5px;font-weight:700;letter-spacing:.05em;
+    padding:4px 10px;border-radius:999px;
+    background:var(--panel-2);color:var(--dim);
+    border:1px solid var(--border);
+  }
+  .drop-zone .or{
+    font-size:11px;color:var(--dim-2);font-weight:700;
+    letter-spacing:.08em;text-transform:uppercase;margin-top:4px;
+  }
+  .drop-zone .btn{
+    margin-top:6px;
+  }
+  .drop-zone input[type=file]{display:none}
+
+  /* Inline status message inside drop zone */
+  .drop-status{
+    margin-top:6px;font-size:12px;font-weight:600;
+    padding:8px 14px;border-radius:8px;
+    display:none;max-width:100%;
+  }
+  .drop-status.show{display:block}
+  .drop-status.ok{background:rgba(34,197,94,.12);color:#15803d;
+    border:1px solid rgba(34,197,94,.35)}
+  .drop-status.err{background:rgba(239,68,68,.12);color:#b91c1c;
+    border:1px solid rgba(239,68,68,.35)}
+  body.dark .drop-status.ok{color:#4ade80}
+  body.dark .drop-status.err{color:#f87171}
+
+  /* Recent */
+  .recent{background:var(--panel);border:1px solid var(--border);
+    border-radius:14px;padding:18px 20px;box-shadow:var(--shadow)}
+  .recent h3{font-size:12px;font-weight:700;color:var(--dim);
+    letter-spacing:.05em;text-transform:uppercase;margin-bottom:12px}
+  .recent-list{display:flex;flex-direction:column;gap:6px}
+  .recent-item{display:flex;align-items:center;gap:12px;padding:9px 12px;
+    border-radius:8px;background:var(--panel-2);font-size:12px;
+    transition:background .1s;cursor:pointer}
+  .recent-item:hover{background:var(--hover)}
+  .recent-item .icon{font-size:15px;flex-shrink:0}
+  .recent-item .name{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .recent-item .meta{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+  .recent-empty{font-size:12px;color:var(--dim-2);font-style:italic;padding:6px 2px}
+
+  .footer{display:flex;justify-content:space-between;align-items:center;
+    font-size:11px;color:var(--dim-2);padding-top:12px;border-top:1px solid var(--border)}
+  .footer a{color:var(--dim);text-decoration:none;font-weight:600}
+  .footer a:hover{color:var(--accent-2)}
+
+  @media (max-width: 720px){
+    body{padding:20px 16px 32px}
+    .brand h1{font-size:26px}
+    .drop-zone{padding:26px 18px}
+    .drop-zone .em{font-size:34px}
+  }
+</style>
+</head>
+<body>
+<main class="landing">
+
+  <header class="header">
+    <div class="brand">
+      <h1>RenderBlox</h1>
+      <span class="tag">v1.0.0</span>
+    </div>
+    <div class="top-actions">
+      <button class="btn" id="themeBtn" title="Toggle theme">🌙</button>
+    </div>
+  </header>
+
+  <section>
+    <div class="tagline">
+      Make and animate Roblox characters. Two tools, one workflow — build your
+      character in the Character Maker, save it as <code>.rx6</code>, then drop
+      it into the Scene Editor to animate and export video.
+    </div>
+  </section>
+
+  <section class="card-grid">
+    <a class="card" href="editor.html">
+      <span class="em">🎬</span>
+      <h2>Scene Editor</h2>
+      <p>Build a scene, place characters, animate with keyframes and camera
+         keys, add music and sounds, and export to MP4.</p>
+      <span class="badge">Editor</span>
+    </a>
+
+    <a class="card" href="chareditor.html">
+      <span class="em">🎭</span>
+      <h2>Character Maker</h2>
+      <p>Pose an R6, paint body parts, add hats and accessories, and export as
+         <code>.rx6</code> to use in the Scene Editor.</p>
+      <span class="badge">Maker</span>
+    </a>
+  </section>
+
+  <section>
+    <div class="drop-zone" id="dropZone">
+      <span class="em">📁</span>
+      <h2>Got a save file?</h2>
+      <p>Drag and drop it here, or click to browse. We'll detect the format
+         and open it in the right tool.</p>
+      <div class="formats">
+        <span class="format-pill">.rdbx — Scene</span>
+        <span class="format-pill">.rx6 — Character</span>
+      </div>
+      <div class="or">or</div>
+      <button class="btn primary" id="browseBtn" type="button">📂 Upload a file</button>
+      <input type="file" id="fileInput" accept=".rdbx,.rx6" />
+      <div class="drop-status" id="dropStatus"></div>
+    </div>
+  </section>
+
+  <section class="recent" id="recentSection">
+    <h3>Recent</h3>
+    <div class="recent-list" id="recentList"></div>
+  </section>
+
+  <footer class="footer">
+    <span>Built on Three.js · WebCodecs · Mediabunny</span>
+    <span><a href="#" id="clearRecent">Clear recent</a></span>
+  </footer>
+
+</main>
+
+<script type="module">
+import {
+  toast, getRecentFiles, clearRecentFiles, pushRecentFile,
+  formatBytes, formatRelativeTime, toggleTheme, applySavedTheme,
+  detectRdbxFormat, escapeHtml
+} from './shared/common.js';
+
+applySavedTheme();
+
+// ---- Theme button ----
+document.getElementById('themeBtn').addEventListener('click', () => {
+  const isDark = toggleTheme();
+  document.getElementById('themeBtn').textContent = isDark ? '☀️' : '🌙';
+});
+if (document.body.classList.contains('dark')) {
+  document.getElementById('themeBtn').textContent = '☀️';
+}
+
+// ---- Drop zone logic ----
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const browseBtn = document.getElementById('browseBtn');
+const dropStatus = document.getElementById('dropStatus');
+
+function setStatus(msg, kind) {
+  dropStatus.className = 'drop-status show ' + kind;
+  dropStatus.textContent = msg;
+}
+
+function clearStatus() {
+  dropStatus.className = 'drop-status';
+  dropStatus.textContent = '';
+}
+
+// Prevent default drag behavior on the whole page so dropping anywhere
+// doesn't navigate away from the page.
+['dragenter','dragover','dragleave','drop'].forEach(evt => {
+  window.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+});
+
+// Highlight the drop zone when dragging a file over it
+['dragenter','dragover'].forEach(evt => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dropZone.classList.add('dragover');
+    clearStatus();
+  });
+});
+
+['dragleave','drop'].forEach(evt => {
+  dropZone.addEventListener(evt, (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.target === dropZone || !dropZone.contains(e.target)) {
+      dropZone.classList.remove('dragover');
+    }
+  });
+});
+
+dropZone.addEventListener('dragleave', (e) => {
+  // Only remove highlight when actually leaving the zone, not entering a child
+  if (!dropZone.contains(e.relatedTarget)) {
+    dropZone.classList.remove('dragover');
+  }
+});
+
+dropZone.addEventListener('drop', async (e) => {
+  dropZone.classList.remove('dragover');
+  const files = e.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  await handleFile(files[0]);
+});
+
+// Click anywhere on the zone (except buttons) opens the file picker
+dropZone.addEventListener('click', (e) => {
+  if (e.target === browseBtn || browseBtn.contains(e.target)) return;
+  if (e.target === fileInput) return;
+  fileInput.click();
+});
+
+browseBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  fileInput.click();
+});
+
+fileInput.addEventListener('change', async () => {
+  if (fileInput.files && fileInput.files[0]) {
+    await handleFile(fileInput.files[0]);
+    fileInput.value = '';
+  }
+});
+
+// ---- File handling ----
+async function handleFile(file) {
+  clearStatus();
+  const name = file.name || 'unknown';
+  const lower = name.toLowerCase();
+  const isRx6 = lower.endsWith('.rx6');
+  const isRdbx = lower.endsWith('.rdbx');
+
+  if (!isRx6 && !isRdbx) {
+    setStatus(`Hmm — “${name}” isn't a .rdbx or .rx6 file.`, 'err');
+    return;
+  }
+
+  // Read enough to sniff the header
+  let arrayBuffer;
+  try {
+    arrayBuffer = await file.arrayBuffer();
+  } catch (err) {
+    console.error(err);
+    setStatus('Could not read the file. Try again?', 'err');
+    return;
+  }
+
+  const fmt = await detectRdbxFormat(arrayBuffer);
+  if (fmt === 'unknown') {
+    setStatus(`“${name}” doesn't look like a valid RenderBlox file.`, 'err');
+    return;
+  }
+
+  // Stash the file in browser storage so the editor can pick it up
+  // when the user clicks through. Round 2 will replace this with a
+  // direct handoff.
+  try {
+    const buf = await file.arrayBuffer();
+    const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+    sessionStorage.setItem('renderblox_pendingFile', JSON.stringify({
+      name,
+      size: file.size,
+      type: isRx6 ? 'rx6' : 'rdbx',
+      format: fmt,
+      data: base64
+    }));
+  } catch (err) {
+    console.warn('Could not stash file in sessionStorage', err);
+    // Non-fatal — file just won't auto-open
+  }
+
+  pushRecentFile({ name, type: isRx6 ? 'rx6' : 'rdbx', size: file.size });
+  renderRecent();
+
+  if (isRx6) {
+    setStatus(
+      `✓ Loaded “${name}” as a Character file (.rx6). ` +
+      `The Character Maker will open it automatically once it's built.`,
+      'ok'
+    );
+  } else {
+    setStatus(
+      `✓ Loaded “${name}” as a Scene file (.rdbx, ${fmt === 'zip' ? 'new zip format' : 'old JSON format'}). ` +
+      `The Scene Editor will open it automatically once it's built.`,
+      'ok'
+    );
+  }
+}
+
+// ---- Recent list ----
+function renderRecent() {
+  const list = document.getElementById('recentList');
+  const items = getRecentFiles();
+  if (items.length === 0) {
+    list.innerHTML = '<div class="recent-empty">No recent files yet. Drop a scene or character above, and it\'ll appear here.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach(f => {
+    const el = document.createElement('div');
+    el.className = 'recent-item';
+    const icon = f.type === 'rdbx' ? '🎬' : (f.type === 'rx6' ? '🎭' : '📄');
+    el.innerHTML = `
+      <span class="icon">${icon}</span>
+      <span class="name">${escapeHtml(f.name)}</span>
+      <span class="meta">${formatBytes(f.size)} · ${formatRelativeTime(f.time)}</span>
+    `;
+    el.addEventListener('click', () => {
+      toast('Click “Upload a file” to re-open. Recent items are a shortcut, not storage.');
+    });
+    list.appendChild(el);
+  });
+}
+
+document.getElementById('clearRecent').addEventListener('click', (e) => {
+  e.preventDefault();
+  clearRecentFiles();
+  renderRecent();
+  toast('Recent list cleared');
+});
+
+renderRecent();
+
+// ---- If the user came back from the editor after saving, we might have
+//      a pending file. Nothing to do here yet, but log so it's visible
+//      in the console for debugging.
+try {
+  const pending = sessionStorage.getItem('renderblox_pendingFile');
+  if (pending) {
+    const parsed = JSON.parse(pending);
+    console.log('[RenderBlox] Pending file waiting for editor:', parsed.name, parsed.type);
+  }
+} catch {}
+</script>
+</body>
+</html>

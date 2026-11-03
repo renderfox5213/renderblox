@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>RenderBlox — Character Maker</title>
+<link rel="stylesheet" href="shared/style.css" />
+<link rel="stylesheet" href="shared/editor.css" />
+<style>
+  /* Override editor.css grid: no timeline, no separate camera panel */
+  #app{
+    grid-template-rows:24px 44px 1fr 44px;
+    grid-template-areas:
+      "menu menu menu"
+      "top top top"
+      "left view right"
+      "bottom bottom bottom";
+  }
+  #leftpanel{display:none}
+  #rightpanel{grid-area:right}
+
+  /* Character maker inherits the layout but the right panel
+     is a single tab with stacked sections. */
+  .cm-tabs{margin-bottom:14px}
+  .cm-body{padding:0}
+  .cm-section{margin-bottom:20px}
+  .cm-section-title{
+    font-size:12px;font-weight:800;color:var(--text);
+    letter-spacing:-.005em;margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:center;
+    padding-bottom:8px;border-bottom:1px solid var(--border);
+  }
+  .cm-section-title .badge{
+    font-size:10px;font-weight:700;background:var(--panel-3);
+    padding:2px 8px;border-radius:10px;color:var(--dim);
+  }
+
+  /* Friendly empty state when nothing's loaded */
+  #cm-empty{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(255,255,255,.5);backdrop-filter:blur(3px);
+    z-index:8;pointer-events:none;
+  }
+  body.dark #cm-empty{background:rgba(0,0,0,.4)}
+  #cm-empty.hide{display:none}
+  .cm-empty-box{
+    background:var(--panel);padding:32px 36px;border-radius:16px;
+    box-shadow:var(--shadow-lg);text-align:center;pointer-events:auto;
+    max-width:380px;
+  }
+  .cm-empty-box .em{font-size:48px;line-height:1;margin-bottom:14px;display:block}
+  .cm-empty-box h2{font-size:18px;font-weight:800;margin-bottom:8px}
+  .cm-empty-box p{font-size:13px;color:var(--dim);line-height:1.6;margin-bottom:18px}
+  .cm-empty-box .btn{margin:0 auto}
+
+  /* Save .rx6 button in the topbar */
+  .tb-btn.save-rx6{
+    background:var(--accent);color:#fff;border-color:var(--accent);font-weight:700;
+  }
+  .tb-btn.save-rx6:hover{filter:brightness(1.08);background:var(--accent)}
+
+  /* Attachments preview */
+  .att-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+  .att-card{
+    background:var(--panel-2);border:1px solid var(--border);border-radius:8px;
+    padding:10px;display:flex;flex-direction:column;gap:6px;cursor:pointer;
+    transition:all .12s;text-align:center;
+  }
+  .att-card:hover{border-color:var(--accent-2);background:var(--hover)}
+  .att-card .em{font-size:22px;line-height:1}
+  .att-card .label{font-size:11px;font-weight:700}
+
+  /* Export panel */
+  .cm-export{
+    background:var(--panel-2);border-radius:10px;padding:14px;
+    border:1px solid var(--border);margin-top:10px;
+  }
+  .cm-export .info{
+    font-size:11px;color:var(--dim);line-height:1.5;margin-bottom:10px;
+  }
+  .cm-export .btn{width:100%;padding:11px;font-size:13px}
+</style>
+</head>
+<body>
+<!-- Hidden file inputs -->
+<input type="file" id="fileInputAttach"  accept=".glb,.gltf,.obj">
+<input type="file" id="fileInputFace"    accept="image/*">
+<input type="file" id="fileInputTexture" accept="image/*">
+<input type="file" id="fileInputRx6"     accept=".rx6">
+<input type="file" id="fileInputModel"   accept=".glb,.gltf,.obj">
+
+<div id="app">
+
+  <!-- Menu bar -->
+  <div id="menubar">
+    <div class="menu-item" data-menu="file">File</div>
+    <div class="menu-item" data-menu="edit">Edit</div>
+    <div class="menu-item" data-menu="view">View</div>
+    <div class="menu-item" data-menu="character">Character</div>
+    <div class="menu-item" data-menu="help">Help</div>
+  </div>
+
+  <!-- Top toolbar -->
+  <div id="topbar">
+    <div class="logo">RenderBlox<span>Character Maker</span></div>
+    <button class="tb-btn primary" id="btnAddR6"><span class="ico">🎭</span>New Character</button>
+    <button class="tb-btn" id="btnImportRx6"><span class="ico">📥</span>Import .rx6</button>
+<button class="tb-btn" id="btnImportModel"><span class="ico">📦</span>Import Model</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn on" id="btnModeMove"><span class="ico">✥</span>Move</button>
+    <button class="tb-btn" id="btnModeRotate"><span class="ico">↻</span>Rotate</button>
+    <button class="tb-btn" id="btnModeScale"><span class="ico">⤢</span>Scale</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn" id="btnBoneMode" title="Bone mode (B)"><span class="ico">🦴</span>Bone</button>
+
+    <div class="tb-spacer"></div>
+
+    <button class="tb-btn save-rx6" id="btnSaveRx6"><span class="ico">💾</span>Save .rx6</button>
+
+    <div class="tb-divider"></div>
+
+    <button class="tb-btn" id="btnUndo" disabled><span class="ico">↶</span>Undo</button>
+    <button class="tb-btn" id="btnRedo" disabled><span class="ico">↷</span>Redo</button>
+    <button class="tb-btn" id="btnTheme" title="Toggle theme">🌙</button>
+  </div>
+
+  <!-- Left panel is hidden; kept in DOM so shared CSS grid doesn't break -->
+  <div id="leftpanel"></div>
+
+  <!-- Viewport -->
+  <div id="viewport">
+    <div id="viewport-overlay">
+      <div>Character: <b id="vSel">—</b></div>
+      <div>Parts: <span class="val" id="vParts">0</span></div>
+      <div>View: <span class="val" id="vMode">Editor</span></div>
+      <div id="vBone" style="display:none">Bone: <span class="warn" id="vBoneName">—</span></div>
+    </div>
+    <div id="r6-hud" style="display:none">
+      <div class="hdr" id="r6-hud-name">R6</div>
+      <div>POS <span class="v" id="r6-hud-pos">—</span></div>
+      <div>ROT <span class="v" id="r6-hud-rot">—</span></div>
+      <div>SCL <span class="v" id="r6-hud-scl">—</span></div>
+      <div>ACT <span class="v" id="r6-hud-act">—</span></div>
+    </div>
+    <div id="perf-bar">FPS <b id="perfFps">—</b> · <b id="perfMs">—</b> ms · calls <b id="perfCalls">—</b></div>
+    <div id="crosshair"></div>
+    <div id="bone-banner">🦴 BONE MODE · Click a body part · Gizmo rotates it</div>
+    <div id="toast"></div>
+    <div id="status-overlay">Loading models/r6.glb…</div>
+
+    <!-- Empty state -->
+    <div id="cm-empty">
+      <div class="cm-empty-box">
+        <span class="em">🎭</span>
+        <h2>No character loaded</h2>
+        <p>Start with a fresh R6, or open a character you've saved as <code>.rx6</code>.</p>
+        <button class="btn primary" id="cm-empty-new">New R6 Character</button>
+      </div>
+    </div>
+
+    <!-- Model load error overlay -->
+    <div id="model-error-overlay">
+      <div class="model-error-box">
+        <h3>⚠ Could not load the R6 model</h3>
+        <p>The editor can't create characters without <code>models/r6.glb</code>.</p>
+        <div class="details" id="model-error-details"></div>
+        <div class="hint" id="model-error-hint"></div>
+        <div class="btns">
+          <button class="btn" id="model-error-dismiss">Dismiss</button>
+          <button class="btn primary" id="model-error-retry">Retry</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right panel -->
+  <div id="rightpanel">
+    <div class="cm-body">
+      <div class="cm-section">
+        <div class="cm-section-title">
+          Pose
+          <span class="badge" id="cm-bones-count">0 bones</span>
+        </div>
+        <div class="preset-grid" id="presetGrid">
+          <button class="preset-btn on" data-preset="idle"><span class="em">😀</span>Idle</button>
+          <button class="preset-btn" data-preset="wave"><span class="em">👋</span>Wave</button>
+          <button class="preset-btn" data-preset="point"><span class="em">👉</span>Point</button>
+          <button class="preset-btn" data-preset="walk"><span class="em">🚶</span>Walk</button>
+          <button class="preset-btn" data-preset="dance"><span class="em">🕺</span>Dance</button>
+          <button class="preset-btn" data-preset="rest"><span class="em">🧍</span>Rest</button>
+        </div>
+      </div>
+
+      <div class="cm-section">
+        <div class="cm-section-title">
+          Appearance
+          <span class="badge" id="cm-meshes-count">0 parts</span>
+        </div>
+        <div id="appearanceList"></div>
+      </div>
+
+      <div class="cm-section">
+        <div class="cm-section-title">Face Decal</div>
+        <div id="faceSection"></div>
+      </div>
+
+      <div class="cm-section">
+        <div class="cm-section-title">Attachments</div>
+        <div class="att-grid">
+          <div class="att-card" id="attHatBtn">
+            <span class="em">🎩</span>
+            <span class="label">Top Hat</span>
+          </div>
+          <div class="att-card" id="attImportBtn">
+            <span class="em">📥</span>
+            <span class="label">Import GLB</span>
+          </div>
+          <div class="att-card" id="attTextBtn">
+            <span class="em">🅰</span>
+            <span class="label">Text</span>
+          </div>
+          <div class="att-card" id="attPrimBtn">
+            <span class="em">▢</span>
+            <span class="label">Box</span>
+          </div>
+        </div>
+        <div id="attList"></div>
+      </div>
+
+      <div class="cm-section">
+        <div class="cm-section-title">Bones</div>
+        <div class="bone-list" id="boneList"></div>
+        <button class="mini-btn" id="bnReset" style="width:100%;padding:8px;margin-top:8px">↺ Reset All Bones</button>
+      </div>
+
+      <div class="cm-section">
+        <div class="cm-section-title">Export</div>
+        <div class="cm-export">
+          <div class="info">
+            Saves the character as a <code>.rx6</code> file.
+            Includes painted colors, attachments, face decals, and current pose.
+            Open it in the Scene Editor to animate and render.
+          </div>
+          <button class="btn primary" id="cmSaveBtn">💾 Save as .rx6</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom bar (shortcuts reminder only) -->
+  <div id="bottombar">
+    <div class="info">
+      <div><label>CHARACTER</label><span id="timeDisplay">—</span></div>
+      <div><label>FPS</label><span id="fpsDisplay">60</span></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="info">
+      <label><kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">B</kbd> Bone mode</label>
+      <label><kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">G</kbd> / <kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">R</kbd> / <kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">S</kbd> gizmo</label>
+      <label><kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">Ctrl</kbd>+<kbd style="padding:1px 6px;background:var(--panel-3);border-radius:4px;font-family:monospace">S</kbd> save</label>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+    "jszip": "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm",
+    "mediabunny": "https://cdn.jsdelivr.net/npm/mediabunny@1/+esm"
+  }
+}
+</script>
+
+<script type="module" src="shared/chareditor-main.js"></script>
+
+
+<!-- Character Gender Modal -->
+<div id="char-gender-backdrop" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)">
+  <div style="background:var(--panel);border-radius:14px;padding:26px 28px;box-shadow:var(--shadow-lg);min-width:300px;text-align:center">
+    <h3 style="font-size:15px;font-weight:800;margin-bottom:18px">Choose Character</h3>
+    <div style="display:flex;gap:12px;justify-content:center;margin-bottom:22px">
+      <button class="btn" id="btn-gender-male" style="padding:20px;font-size:24px;flex:1" title="Male R6">♂</button>
+      <button class="btn" id="btn-gender-female" style="padding:20px;font-size:24px;flex:1" title="Female R6">♀</button>
+    </div>
+    <button class="btn" id="btn-gender-cancel" style="width:100%">Cancel</button>
+  </div>
+</div>
+
+</body>
+</html>

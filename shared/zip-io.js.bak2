@@ -1,0 +1,1372 @@
+// ============================================================
+// RenderBlox — Zip save/load
+// Handles .rdbx (scene) and .rx6 (character) in zip format,
+// plus backward compatibility with the old JSON-in-header format.
+// ============================================================
+
+import JSZip from 'jszip';
+import * as THREE from 'three';
+import { detectRdbxFormat, toast } from './common.js';
+import {
+  sceneState, buildCharacter, addModelFromRoot,
+  addR6Character, addPrimitive, addLight,
+  getMats, setMeshColor, setMeshMap, cloneMaterialWithBackup,
+  interpolateCamera, clearAllObjects
+} from './scene.js';
+
+// ------------------------------------------------------------
+// Asset store — in-memory registry of every binary referenced
+// by the scene. Assets get copied into the zip on save and
+// materialized as object URLs on load.
+// ------------------------------------------------------------
+export const assetStore = {
+  nextId: 1,
+  map: {},
+  register(type, name, bytes) {
+    const id = 'asset_' + (this.nextId++);
+    this.map[id] = { type, name, bytes };
+    return id;
+  },
+  get(id) { return this.map[id] || null; },
+  clear() { this.map = {}; this.nextId = 1; }
+};
+
+// ------------------------------------------------------------
+// Sound store — separate from assets because sounds live in
+// their own zip folder and have runtime metadata (position,
+// volume, mute, startTime).
+// ------------------------------------------------------------
+export const soundStore = {
+  nextId: 1,
+  map: {},
+  register(name, bytes) {
+    const id = 'sound_' + (this.nextId++);
+    this.map[id] = {
+      id,
+      name,
+      bytes,
+      position: [0, 2, 0],
+      volume: 1.0,
+      muted: false,
+      startTime: 0,
+      duration: 0, // filled in when decoded
+      assetId: null
+    };
+    return id;
+  },
+  get(id) { return this.map[id] || null; },
+  remove(id) { delete this.map[id]; },
+  all() { return Object.values(this.map); },
+  clear() { this.map = {}; this.nextId = 1; }
+};
+
+// ------------------------------------------------------------
+// Base64 helpers
+// ------------------------------------------------------------
+export function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+export function base64ToArrayBuffer(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Shared by .rdbx and .rx6 saves: asset attachments keep their transform,
+// procedural (code-built) attachments are serialized inline.
+function serializeAttachments(obj) {
+  return (obj.attachments || []).map(a => {
+    const entry = { name: a.name, assetId: a.assetId || null };
+    if (a.mesh) entry.transform = {
+      p: [a.mesh.position.x, a.mesh.position.y, a.mesh.position.z],
+      q: [a.mesh.quaternion.x, a.mesh.quaternion.y, a.mesh.quaternion.z, a.mesh.quaternion.w],
+      s: [a.mesh.scale.x, a.mesh.scale.y, a.mesh.scale.z]
+    };
+    if (!a.assetId && a.mesh) {
+      try { entry.inline = serializeAttachmentMesh(a.mesh, obj.root); }
+      catch (e) { console.warn('Attachment serialize failed:', e); }
+    }
+    return entry;
+  });
+}
+
+// The built-in R6 template loads asynchronously. If a file is opened before it
+// is ready, wait for it instead of silently skipping every built-in character.
+async function waitForR6Template(maxMs = 15000) {
+  const t0 = Date.now();
+  while (!sceneState.getR6Template?.() && Date.now() - t0 < maxMs) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return !!sceneState.getR6Template?.();
+}
+
+async function waitForR6GirlTemplate(maxMs = 15000) {
+  // Already loaded? We're good.
+  if (window.__renderbloxSceneGirlTemplate) return true;
+  
+  // If the editor gave us the loader function, use it!
+  if (window.__renderbloxLoadGirlTemplate) {
+    try {
+      const tpl = await window.__renderbloxLoadGirlTemplate();
+      if (tpl) {
+        window.__renderbloxSceneGirlTemplate = tpl;
+        return true;
+      }
+    } catch (e) {
+      console.warn('Failed to load girl template via hook', e);
+    }
+  }
+  
+  // Fallback: fetch it manually if the hook wasn't available
+  try {
+    const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+    return new Promise((resolve) => {
+      new GLTFLoader().load('models/r6-girl.glb', (gltf) => {
+        window.__renderbloxSceneGirlTemplate = gltf;
+        resolve(true);
+      }, undefined, (err) => {
+        console.error('Fallback girl loader failed', err);
+        resolve(false);
+      });
+    });
+  } catch (e) {
+    console.error('Failed to import GLTFLoader', e);
+    return false;
+  }
+}
+
+
+// ------------------------------------------------------------
+// Face / look helpers (shared by .rdbx and .rx6)
+// ------------------------------------------------------------
+function faceAssetIds(o) {
+  const ids = new Set();
+  const add = (k) => { if (typeof k === 'string' && k.startsWith('asset:')) ids.add(k.slice(6)); };
+  add(o.faceKey);
+  if (o.faceDecal?.userData?.textureAssetId) ids.add(o.faceDecal.userData.textureAssetId);
+  (o.lookKeys || []).forEach(k => add(k.look?.face));
+  return [...ids];
+}
+
+function serializeFace(o) {
+  if (o.faceDecal) {
+    const u = o.faceDecal.userData;
+    return {
+      faceKey: o.faceKey || null,
+      textureAssetId: u.textureAssetId || null,
+      scale: u.scale || 1, yOff: u.yOff || 0, zOff: u.zOff || 0.55, xOff: u.xOff || 0
+    };
+  }
+  return o.faceKey === 'none' ? { faceKey: 'none' } : null;
+}
+
+async function restoreFace(obj, fd) {
+  // look-key faces first, so playback never waits on a texture
+  for (const k of (obj.lookKeys || [])) {
+    const f = k.look?.face;
+    if (f && f !== 'none' && f !== 'default') { try { await sceneState.ensureFaceTexture?.(f); } catch {} }
+  }
+  if (!fd || obj.type !== 'r6') return;
+  if (!sceneState.setFaceByKey) {
+    // Editors without the face library (character editor): classic single-decal restore
+    if (fd.textureAssetId && sceneState.createFaceDecal) {
+      const fa = assetStore.get(fd.textureAssetId);
+      const tex = fa ? await loadTextureFromBytes(fa.bytes) : null;
+      if (tex) {
+        sceneState.createFaceDecal(obj, tex, URL.createObjectURL(new Blob([fa.bytes])), fd.textureAssetId);
+        if (obj.faceDecal) {
+          obj.faceDecal.userData.scale = fd.scale ?? 1;
+          obj.faceDecal.userData.yOff = fd.yOff ?? 0;
+          obj.faceDecal.userData.zOff = fd.zOff ?? 0.55;
+          sceneState.updateFaceDecal?.(obj);
+        }
+      }
+    }
+    return;
+  }
+  const key = fd.faceKey || (fd.textureAssetId ? 'asset:' + fd.textureAssetId : null);
+  if (!key) return;
+  if (key.startsWith('asset:') && !assetStore.get(key.slice(6))) return;
+  await sceneState.ensureFaceTexture?.(key);
+  sceneState.setFaceByKey?.(obj, key, { scale: fd.scale ?? 1.6, yOff: fd.yOff ?? 0.6, zOff: fd.zOff ?? 0.6, xOff: fd.xOff ?? 0 });
+}
+
+// ------------------------------------------------------------
+// Serialize the current scene into a JSON manifest
+// ------------------------------------------------------------
+function buildManifest() {
+  const usedAssetIds = new Set();
+  const usedSoundIds = new Set();
+
+  sceneState.objects.forEach(o => {
+    // Imported .rx6 characters: the original .rx6 file itself is stored in the
+    // zip and is the source of truth for their look, so nothing else is needed.
+    if (o.rx6AssetId) { usedAssetIds.add(o.rx6AssetId); return; }
+    if (o.assetId) usedAssetIds.add(o.assetId);
+    (o.attachments || []).forEach(a => { if (a.assetId) usedAssetIds.add(a.assetId); });
+    (o.meshes || []).forEach(m => {
+      if (m.mesh.userData.textureAssetId) usedAssetIds.add(m.mesh.userData.textureAssetId);
+    });
+    faceAssetIds(o).forEach(id => usedAssetIds.add(id));
+  });
+  soundStore.all().forEach(s => usedSoundIds.add(s.id));
+
+  return {
+    format: 'RDBX',
+    version: '1.0.0',
+    saved: new Date().toISOString(),
+    duration: sceneState.duration,
+    camKeyframes: sceneState.camKeyframes,
+    objects: sceneState.objects.map(o => ({
+      type: o.type,
+      name: o.name,
+      primType: o.primType,
+      position: [o.root.position.x, o.root.position.y, o.root.position.z],
+      quat: [o.root.quaternion.x, o.root.quaternion.y, o.root.quaternion.z, o.root.quaternion.w],
+      scale: [o.root.scale.x, o.root.scale.y, o.root.scale.z],
+      visible: o.root.visible,
+      color: o.color,
+      intensity: o.intensity,
+      currentAction: o.currentAction,
+      hiddenParts: o.hiddenParts || [],
+      partColors: o.partColors || {},
+      keyframes: o.keyframes,
+      lookKeys: o.lookKeys || [],
+      faceKey: o.faceKey || null,
+      assetId: o.assetId || null,
+      rx6AssetId: o.rx6AssetId || null,
+      meshStates: (o.meshes || []).map(m => {
+        const mats = getMats(m.mesh);
+        return {
+          name: m.name,
+          visible: m.mesh.visible,
+          color: mats[0]?.color
+            ? [mats[0].color.r, mats[0].color.g, mats[0].color.b]
+            : null,
+          colors: mats.map(mt => mt?.color ? [mt.color.r, mt.color.g, mt.color.b] : null),
+          opacity: mats[0] ? mats[0].opacity : 1,
+          glow: mats[0]?.userData?.__glow || 0,
+          textureAssetId: m.mesh.userData.textureAssetId || null
+        };
+      }),
+      bones: o.bones ? Object.fromEntries(Object.keys(o.bones).map(n => {
+        const b = o.bones[n].obj;
+        return [n, {
+          q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w],
+          p: [b.position.x, b.position.y, b.position.z]
+        }];
+      })) : null,
+      faceDecal: serializeFace(o),
+      attachments: serializeAttachments(o)
+    })),
+    environment: sceneState.getEnvironment ? sceneState.getEnvironment() : null,
+    sounds: soundStore.all().map(s => ({
+      id: s.id,
+      name: s.name,
+      position: s.position,
+      volume: s.volume,
+      muted: s.muted,
+      startTime: s.startTime,
+      duration: s.duration
+    })),
+    assetIds: [...usedAssetIds],
+    soundIds: [...usedSoundIds]
+  };
+}
+
+// ------------------------------------------------------------
+// Save — produces a .rdbx (or .rx6) zip
+// ------------------------------------------------------------
+export async function saveSceneZip(filename = null) {
+  const manifest = buildManifest();
+  const zip = new JSZip();
+
+  // Manifest
+  zip.file('renderblox.json', JSON.stringify(manifest, null, 2));
+
+  // Objects folder — GLB/OBJ files
+  const objectsFolder = zip.folder('objects');
+  for (const id of manifest.assetIds) {
+    const asset = assetStore.get(id);
+    if (!asset) { console.warn(`Save: asset ${id} is referenced but missing from assetStore`); continue; }
+    const safeName = (asset.name || 'asset').replace(/[^a-zA-Z0-9._-]/g, '_');
+    objectsFolder.file(`${id}_${safeName}`, asset.bytes);
+  }
+
+  // Sounds folder — audio files
+  const soundsFolder = zip.folder('sounds');
+  for (const s of soundStore.all()) {
+    const ext = (s.name || 'sound.mp3').split('.').pop() || 'mp3';
+    const safeName = (s.name || 'sound').replace(/[^a-zA-Z0-9._-]/g, '_');
+    soundsFolder.file(`${s.id}.${ext}`, s.bytes);
+  }
+
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 }
+  });
+
+  const defaultName = filename || `renderblox_scene_${Date.now()}.rdbx`;
+  triggerDownload(blob, defaultName);
+  return { blob, filename: defaultName, manifest };
+}
+
+// ------------------------------------------------------------
+// Load — handles BOTH new zip format and old JSON format
+// ------------------------------------------------------------
+export async function loadSceneZip(file) {
+  const buffer = await file.arrayBuffer();
+  const format = await detectRdbxFormat(buffer);
+
+  if (format === 'old-json') {
+    return await loadOldJsonFormat(buffer, file.name);
+  }
+  if (format === 'zip') {
+    return await loadZipFormat(buffer, file.name);
+  }
+  throw new Error('File is neither a valid .rdbx nor a zip archive.');
+}
+
+// Old format: "RDBX\x00\x00\x00\x09" header, then JSON with base64 assets
+async function loadOldJsonFormat(buffer, filename) {
+  const bytes = new Uint8Array(buffer);
+  let start = 0;
+  for (let i = 0; i < Math.min(bytes.length, 100); i++) {
+    if (bytes[i] === 0x7B) { start = i; break; }
+  }
+  const text = new TextDecoder().decode(bytes.subarray(start));
+  const data = JSON.parse(text);
+  if (data.format !== 'RDBX') {
+    throw new Error('Not a valid old-format RDBX file.');
+  }
+
+  // Migrate assets from base64 to assetStore
+  assetStore.clear();
+  if (data.assets) {
+    for (const id in data.assets) {
+      const a = data.assets[id];
+      assetStore.map[id] = {
+        type: a.type,
+        name: a.name,
+        bytes: base64ToArrayBuffer(a.data)
+      };
+    }
+    const maxId = Object.keys(data.assets).reduce((m, k) => {
+      const n = parseInt(k.replace('asset_', ''));
+      return isNaN(n) ? m : Math.max(m, n);
+    }, 0);
+    assetStore.nextId = maxId + 1;
+  }
+
+  soundStore.clear();
+
+  return await rebuildScene(data, 'old');
+}
+
+// New format: zip archive
+async function loadZipFormat(buffer, filename) {
+  const zip = await JSZip.loadAsync(buffer);
+  const manifestFile = zip.file('renderblox.json');
+  if (!manifestFile) {
+    throw new Error('Zip is missing renderblox.json.');
+  }
+  const manifestText = await manifestFile.async('text');
+  const manifest = JSON.parse(manifestText);
+  if (manifest.format !== 'RDBX' && manifest.format !== 'RX6') {
+    throw new Error('Manifest does not look like a RenderBlox file.');
+  }
+  if (manifest.format === 'RX6') {
+    // A character file was opened where a scene was expected: import it as a character.
+    const o = await loadRx6IntoScene(new File([buffer], filename || 'character.rx6'));
+    return { filename: filename || 'character.rx6', objectsLoaded: o ? 1 : 0, soundsLoaded: 0, warnings: [] };
+  }
+
+  // Extract assets
+  assetStore.clear();
+  if (manifest.assetIds) {
+    for (const id of manifest.assetIds) {
+      const pathPrefix = `objects/${id}_`;
+      const fileKey = Object.keys(zip.files).find(
+        k => k.startsWith(pathPrefix) && !zip.files[k].dir
+      );
+      if (!fileKey) continue;
+      const bytes = await zip.files[fileKey].async('arraybuffer');
+      const name = fileKey.substring(pathPrefix.length);
+      const type = /\.rx6$/i.test(name) ? 'rx6'
+        : /\.obj$/i.test(name) ? 'obj'
+        : /\.(png|jpg|jpeg|webp)$/i.test(name) ? 'texture'
+        : 'glb';
+      assetStore.map[id] = { type, name, bytes };
+    }
+    const maxId = manifest.assetIds.reduce((m, k) => {
+      const n = parseInt(k.replace('asset_', ''));
+      return isNaN(n) ? m : Math.max(m, n);
+    }, 0);
+    assetStore.nextId = maxId + 1;
+  }
+
+  // Extract sounds
+  soundStore.clear();
+  if (manifest.sounds) {
+    for (const s of manifest.sounds) {
+      const candidateKeys = Object.keys(zip.files).filter(
+        k => k.startsWith(`sounds/${s.id}.`) && !zip.files[k].dir
+      );
+      if (candidateKeys.length === 0) continue;
+      const fileKey = candidateKeys[0];
+      const bytes = await zip.files[fileKey].async('arraybuffer');
+      soundStore.map[s.id] = {
+        id: s.id,
+        name: s.name,
+        bytes,
+        position: s.position || [0, 2, 0],
+        volume: s.volume ?? 1.0,
+        muted: s.muted ?? false,
+        startTime: s.startTime || 0,
+        duration: s.duration || 0,
+        assetId: null
+      };
+      const n = parseInt(s.id.replace('sound_', ''));
+      if (!isNaN(n) && n >= soundStore.nextId) soundStore.nextId = n + 1;
+    }
+  }
+
+  return await rebuildScene(manifest, 'zip');
+}
+
+// ------------------------------------------------------------
+// Rebuild scene state from a manifest (shared between formats)
+// ------------------------------------------------------------
+async function rebuildScene(manifest, sourceFormat) {
+  // Clear the current scene
+  clearAllObjects();
+  sceneState.camKeyframes = manifest.camKeyframes || [];
+  sceneState.duration = manifest.duration || 10;
+
+  // Rebuild objects — these need GLTFLoader / OBJLoader which
+  // are passed via sceneState.getR6Template for the builtin case
+  const addedObjects = [];
+  const warnings = [];
+
+  for (const od of (manifest.objects || [])) {
+    try {
+      let obj = null;
+      let fromRx6 = false;
+
+      if (od.type === 'r6') {
+        if (od.rx6AssetId && assetStore.get(od.rx6AssetId)) {
+          // Imported character: rebuild it from the original .rx6 stored in the file
+          const rxAsset = assetStore.get(od.rx6AssetId);
+          await waitForR6Template();
+          obj = await loadRx6IntoScene(new Blob([rxAsset.bytes]), {
+            keepPlacement: true, rx6AssetId: od.rx6AssetId, name: rxAsset.name
+          });
+          if (od.name) obj.name = od.name;
+          fromRx6 = true;
+        } else if (od.assetId) {
+          const asset = assetStore.get(od.assetId);
+          if (!asset) { console.warn(`Missing asset ${od.assetId} for R6`); continue; }
+          const root = await loadGLTFRootFromBytes(asset.bytes);
+          if (!root) continue;
+          obj = buildCharacter(root, od.name);
+          obj.assetId = od.assetId;
+        } else {
+          await waitForR6Template();
+          if (!sceneState.getR6Template?.()) {
+            console.warn('R6 template not loaded, skipping builtin R6');
+            warnings.push(`"${od.name}" skipped: R6 template not loaded`);
+            continue;
+          }
+          obj = addR6Character(od.name);
+        }
+        obj.currentAction = od.currentAction || 'idle';
+      } else if (od.type === 'light') {
+        obj = addLight(od.color, od.intensity);
+        obj.name = od.name;
+      } else if (od.type === 'primitive') {
+        obj = addPrimitive(od.primType);
+        obj.name = od.name;
+      } else if (od.type === 'model') {
+        const asset = assetStore.get(od.assetId);
+        if (!asset) { console.warn(`Missing asset ${od.assetId} for model`); continue; }
+        const root = asset.type === 'obj'
+          ? await loadOBJRootFromBytes(asset.bytes)
+          : await loadGLTFRootFromBytes(asset.bytes);
+        if (!root) continue;
+        obj = addModelFromRoot(root, od.name, od.assetId);
+      }
+
+      if (!obj) continue;
+
+      // Apply transform
+      obj.root.position.set(...od.position);
+      if (od.quat) obj.root.quaternion.set(...od.quat);
+      if (Array.isArray(od.scale)) obj.root.scale.set(...od.scale);
+      else if (od.scale) obj.root.scale.setScalar(od.scale);
+      if (od.visible !== undefined) obj.root.visible = od.visible;
+
+      // Restore keyframes
+      obj.keyframes = od.keyframes || [];
+      if (((od.partColors && Object.keys(od.partColors).length > 0) || (od.hiddenParts && od.hiddenParts.length)) && obj.type === 'r6') {
+        obj.hiddenParts = od.hiddenParts || [];
+        obj.partColors = od.partColors || {};
+        const { applyCharacterAppearance } = await import('./scene.js');
+        applyCharacterAppearance(obj, obj.hiddenParts, obj.partColors);
+      }
+      obj.lookKeys = od.lookKeys || [];
+
+      // Restore bone pose (manual poses without keyframes)
+      if (od.bones && obj.bones) {
+        for (const n in od.bones) {
+          const e = obj.bones[n]; const d = od.bones[n];
+          if (!e || !d) continue;
+          if (d.q) e.obj.quaternion.set(...d.q);
+          if (d.p) e.obj.position.set(...d.p);
+        }
+      }
+
+      // Restore mesh states
+      try { if (!fromRx6 && od.meshStates && obj.meshes) {
+        for (let i = 0; i < od.meshStates.length && i < obj.meshes.length; i++) {
+          const ms = od.meshStates[i];
+          const entry = obj.meshes[i];
+          entry.mesh.visible = ms.visible !== false;
+          if (ms.color) {
+            setMeshColor(entry.mesh, new THREE.Color(ms.color[0], ms.color[1], ms.color[2]));
+          }
+          if (ms.opacity != null && ms.opacity < 0.999) getMats(entry.mesh).forEach(mt => { mt.transparent = true; mt.opacity = ms.opacity; });
+          if (ms.glow) getMats(entry.mesh).forEach(mt => { if (mt.emissive) { mt.userData.__glow = ms.glow; mt.emissive.copy(mt.color); mt.emissiveIntensity = ms.glow; } });
+          if (Array.isArray(ms.colors) && ms.colors.length > 1) {
+            const mm = getMats(entry.mesh);
+            ms.colors.forEach((c, k) => { if (c && mm[k]?.color) mm[k].color.setRGB(c[0], c[1], c[2]); });
+          }
+          if (ms.textureAssetId) {
+            const texAsset = assetStore.get(ms.textureAssetId);
+            if (texAsset) {
+              const tex = await loadTextureFromBytes(texAsset.bytes);
+              if (tex) {
+                setMeshMap(entry.mesh, tex);
+                entry.mesh.userData.textureAssetId = ms.textureAssetId;
+              }
+            }
+          }
+        }
+      } } catch (e) { console.error('mesh state restore failed:', od.name, e); warnings.push(`"${od.name}": colors/textures`); }
+
+      // Restore face + look-key faces
+      try { if (!fromRx6) await restoreFace(obj, od.faceDecal); }
+      catch (e) { console.error('face restore failed:', od.name, e); warnings.push(`"${od.name}": face`); }
+
+      // Restore attachments
+      if (!fromRx6) obj.attachments = [];
+      for (const attData of (fromRx6 ? [] : (od.attachments || []))) {
+        try {
+        if (!attData.assetId && attData.inline) {
+        try {
+          const _T = await import('three');
+          const _root = deserializeAttachmentMesh(_T, attData.inline);
+          if (_root) {
+            const _hb = (sceneState.findHeadBone && sceneState.findHeadBone(obj))
+              || (obj.bones && obj.bones['Head_01'] && obj.bones['Head_01'].obj)
+              || null;
+            if (_hb) { _hb.add(_root); } // keep the saved head-local transform
+            else { obj.root.add(_root); _root.position.set(0, 3, 0); }
+            obj.attachments.push({ name: attData.name, mesh: _root, assetId: null });
+          }
+        } catch (e) { console.warn('inline attachment rebuild failed:', e); }
+        continue;
+      }
+      if (!attData.assetId) continue;
+        const attAsset = assetStore.get(attData.assetId);
+        if (!attAsset) continue;
+        const attRoot = attAsset.type === 'obj'
+          ? await loadOBJRootFromBytes(attAsset.bytes)
+          : await loadGLTFRootFromBytes(attAsset.bytes);
+        if (!attRoot) continue;
+        const box = new THREE.Box3().setFromObject(attRoot);
+        const size = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size.x, size.y, size.z);
+        if (maxDim > 0.001) attRoot.scale.setScalar(1.5 / maxDim);
+        attRoot.traverse(o => {
+          if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+        });
+        const hb = sceneState.findHeadBone?.(obj);
+        if (hb) { hb.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          }
+          if (attData.transform) _applySavedTransform(attRoot, attData.transform);
+          else _placeOnHead(hb, attRoot); }
+        else { obj.root.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          }
+          if (attData.transform) _applySavedTransform(attRoot, attData.transform);
+        }
+        obj.attachments.push({
+          name: attData.name,
+          mesh: attRoot,
+          assetId: attData.assetId
+        });
+        } catch (e) { console.error('attachment restore failed:', attData.name, e); warnings.push(`"${od.name}": attachment ${attData.name}`); }
+      }
+
+      addedObjects.push(obj);
+    } catch (err) {
+      console.error('Failed to rebuild object:', od.name, err);
+      warnings.push(`"${od.name}" failed: ${err.message}`);
+    }
+  }
+
+  if (manifest.environment) { try { sceneState.applyEnvironment?.(manifest.environment); } catch (e) { console.warn('environment restore failed', e); } }
+  sceneState.selectedId = addedObjects[0]?.id ?? null;
+  sceneState.onChanged?.();
+  sceneState.onSelectionChanged?.(sceneState.selectedId);
+
+  return {
+    filename: sourceFormat === 'zip' ? 'loaded.zip' : 'loaded.json',
+    objectsLoaded: addedObjects.length,
+    soundsLoaded: soundStore.all().length,
+    warnings
+  };
+}
+
+// ------------------------------------------------------------
+// Loader helpers — need THREE + loaders passed in
+// ------------------------------------------------------------
+let _THREE = null;
+let _GLTFLoader = null;
+let _OBJLoader = null;
+
+export function registerLoaders(THREE, GLTFLoader, OBJLoader) {
+  _THREE = THREE;
+  _GLTFLoader = GLTFLoader;
+  _OBJLoader = OBJLoader;
+}
+
+function loadGLTFRootFromBytes(bytes) {
+  return new Promise((resolve) => {
+    if (!_GLTFLoader) { resolve(null); return; }
+    const url = URL.createObjectURL(new Blob([bytes]));
+    const loader = new _GLTFLoader();
+    loader.load(url, (g) => {
+      URL.revokeObjectURL(url);
+      resolve(g.scene);
+    }, undefined, () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    });
+  });
+}
+
+function loadOBJRootFromBytes(bytes) {
+  return new Promise((resolve) => {
+    if (!_OBJLoader) { resolve(null); return; }
+    const url = URL.createObjectURL(new Blob([bytes]));
+    const loader = new _OBJLoader();
+    loader.load(url, (obj) => {
+      URL.revokeObjectURL(url);
+      resolve(obj);
+    }, undefined, () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    });
+  });
+}
+
+function loadTextureFromBytes(bytes) {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(new Blob([bytes]));
+    const img = new Image();
+    img.onload = () => {
+      const tex = new _THREE.Texture(img);
+      tex.needsUpdate = true;
+      tex.colorSpace = _THREE.SRGBColorSpace;
+      URL.revokeObjectURL(url);
+      resolve(tex);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    img.src = url;
+  });
+}
+
+// ------------------------------------------------------------
+// Download helper
+// ------------------------------------------------------------
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// ------------------------------------------------------------
+// Pending file handoff (from index.html drop zone)
+// ------------------------------------------------------------
+export function getPendingFile() {
+  try {
+    const raw = sessionStorage.getItem('renderblox_pendingFile');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    sessionStorage.removeItem('renderblox_pendingFile');
+    if (!parsed.data) return null;
+    const bytes = base64ToArrayBuffer(parsed.data);
+    return {
+      name: parsed.name,
+      type: parsed.type,
+      format: parsed.format,
+      size: parsed.size,
+      file: new File([bytes], parsed.name)
+    };
+  } catch (err) {
+    console.warn('Failed to read pending file', err);
+    return null;
+  }
+}
+// ============================================================
+// Character file (.rx6) save/load
+// Same zip structure as .rdbx but with a single character
+// and its attachments, no sounds, no camera keys.
+// ============================================================
+
+
+// Serialize a programmatic mesh (no asset file) into a JSON-safe snapshot.
+// Handles Group/Primitive/Line/Sphere/Box/Cylinder/Cone meshes + basic materials.
+export function serializeAttachmentMesh(root, charRoot) {
+  if (!root) return null;
+  const isGroup = root.isGroup || (root.children && root.children.length > 0 && !root.isMesh);
+  if (isGroup) {
+    return {
+      kind: 'group',
+      name: root.name || 'Attachment',
+      position: [root.position.x, root.position.y, root.position.z],
+      quaternion: [root.quaternion.x, root.quaternion.y, root.quaternion.z, root.quaternion.w],
+      scale: [root.scale.x, root.scale.y, root.scale.z],
+      children: root.children.map(c => serializeAttachmentMesh(c)).filter(Boolean)
+    };
+  }
+  if (!root.isMesh) return null;
+  const geo = root.geometry;
+  let geometry = null;
+  if (geo) {
+    const type = geo.type;
+    const params = geo.parameters || {};
+    geometry = { type, params: JSON.parse(JSON.stringify(params)) };
+  }
+  const mats = Array.isArray(root.material) ? root.material : [root.material];
+  const materials = mats.filter(Boolean).map(mat => ({
+    type: mat.type,
+    color: mat.color ? '#' + mat.color.getHexString() : null,
+    roughness: mat.roughness ?? null,
+    metalness: mat.metalness ?? null,
+    transparent: mat.transparent ?? false,
+    opacity: mat.opacity ?? 1,
+    side: mat.side ?? 0
+  }));
+  return {
+    kind: 'mesh',
+    name: root.name || 'Mesh',
+    position: [root.position.x, root.position.y, root.position.z],
+    quaternion: [root.quaternion.x, root.quaternion.y, root.quaternion.z, root.quaternion.w],
+    scale: [root.scale.x, root.scale.y, root.scale.z],
+    geometry,
+    materials
+  };
+}
+
+// Rebuild a programmatic mesh from a snapshot produced by serializeAttachmentMesh.
+export function deserializeAttachmentMesh(THREE, snap) {
+  if (!snap) return null;
+  if (snap.kind === 'group') {
+    const g = new THREE.Group();
+    g.name = snap.name || 'Attachment';
+    g.position.set(...(snap.position || [0, 0, 0]));
+    if (snap.quaternion) g.quaternion.set(...snap.quaternion);
+    if (snap.scale) g.scale.set(...snap.scale);
+    for (const child of (snap.children || [])) {
+      const c = deserializeAttachmentMesh(THREE, child);
+      if (c) g.add(c);
+    }
+    return g;
+  }
+  if (snap.kind === 'mesh') {
+    let geo = null;
+    const gt = snap.geometry?.type;
+    const p = snap.geometry?.params || {};
+    if (gt === 'BoxGeometry') geo = new THREE.BoxGeometry(p.width || 1, p.height || 1, p.depth || 1);
+    else if (gt === 'SphereGeometry') geo = new THREE.SphereGeometry(p.radius || 0.5, p.widthSegments || 16, p.heightSegments || 12);
+    else if (gt === 'CylinderGeometry') geo = new THREE.CylinderGeometry(p.radiusTop ?? 0.5, p.radiusBottom ?? 0.5, p.height || 1, p.radialSegments || 24);
+    else if (gt === 'ConeGeometry') geo = new THREE.ConeGeometry(p.radius || 0.5, p.height || 1, p.radialSegments || 24);
+    else if (gt === 'PlaneGeometry') geo = new THREE.PlaneGeometry(p.width || 1, p.height || 1);
+    else if (gt === 'TorusGeometry') geo = new THREE.TorusGeometry(p.radius || 0.6, p.tube || 0.22, p.radialSegments || 16, p.tubularSegments || 32);
+    else geo = new THREE.BoxGeometry(1, 1, 1);
+    const mats = (snap.materials || []).map(m => {
+      const mat = new THREE.MeshStandardMaterial({
+        color: m.color ? new THREE.Color(m.color) : 0xffffff,
+        roughness: m.roughness ?? 0.7,
+        metalness: m.metalness ?? 0.05,
+        transparent: !!m.transparent,
+        opacity: m.opacity ?? 1
+      });
+      return mat;
+    });
+    const mesh = new THREE.Mesh(geo, mats.length > 1 ? mats : (mats[0] || new THREE.MeshStandardMaterial()));
+    mesh.name = snap.name || 'Mesh';
+    mesh.position.set(...(snap.position || [0, 0, 0]));
+    if (snap.quaternion) mesh.quaternion.set(...snap.quaternion);
+    if (snap.scale) mesh.scale.set(...snap.scale);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    return mesh;
+  }
+  return null;
+}
+
+
+// Place a hat/attachment just above the head bone's bounding box.
+// Derives offset from the head's own scale so R6 + imported characters
+// both get a correctly-sized hat.
+function _placeOnHead(headBone, attachment) {
+  try {
+    // Head bone has no geometry, so measure its parent mesh if possible
+    let box = new (attachment.constructor === Object ? Object : Object)(); // dummy
+    // Use THREE.Box3 via the attachment's own constructor chain
+    const THREE = attachment.constructor;
+    // Safer: walk up to find a mesh we can measure, else use bone position
+    let target = headBone;
+    let worldBox = null;
+    if (target) {
+      // Try to compute the head's world-space bounds by looking for a mesh sibling
+      target.updateWorldMatrix(true, true);
+      // If the head bone has a parent mesh, measure that
+      const candidateMeshes = [];
+      target.traverse(o => { if (o.isMesh) candidateMeshes.push(o); });
+      if (candidateMeshes.length > 0 && typeof THREE.Box3 === 'function') {
+        // Can't easily import Box3 here — fall through to manual approach
+      }
+    }
+    // Fallback: scale-relative offset. R6 head bone sits ~0.55 units above
+    // its own origin in local space; imported characters vary. Use parent
+    // mesh's scale if we can find one.
+    let headScale = 1;
+    let p = headBone;
+    while (p) {
+      if (p.scale && p.scale.y && Math.abs(p.scale.y - 1) > 0.01) { headScale = p.scale.y; break; }
+      p = p.parent;
+    }
+    // 0.95 * head scale puts the hat rim right on top of an R6 head
+    const yOff = 0.95 * headScale;
+    attachment.position.set(0, yOff, 0);
+  } catch (e) {
+    console.warn('_placeOnHead failed, using default:', e);
+    attachment.position.set(0, 1.0, 0);
+  }
+}
+
+function _applySavedTransform(o, t) {
+  if (t.p) o.position.set(...t.p);
+  if (t.q) o.quaternion.set(...t.q);
+  if (t.s) o.scale.set(...t.s);
+}
+
+export async function saveRx6(filename = null) {
+  const { sceneState } = await import('./scene.js');
+  const obj = sceneState.objects.find(o => o.id === sceneState.selectedId);
+  if (!obj) throw new Error('No character selected');
+  if (obj.type !== 'r6') throw new Error('Selected object is not a character');
+
+  const usedAssetIds = new Set();
+  (obj.attachments || []).forEach(a => { if (a.assetId) usedAssetIds.add(a.assetId); });
+  (obj.meshes || []).forEach(m => {
+    if (m.mesh.userData.textureAssetId) usedAssetIds.add(m.mesh.userData.textureAssetId);
+  });
+    faceAssetIds(obj).forEach(id => usedAssetIds.add(id));
+
+    const manifest = {
+      format: 'RX6',
+        version: '1.0.0',
+        saved: new Date().toISOString(),
+        character: {
+          name: obj.name,
+          gender: obj.gender || 'male',
+          currentAction: obj.currentAction || 'idle',
+          hiddenParts: obj.hiddenParts || [],
+          partColors: obj.partColors || {},
+          position: [obj.root.position.x, obj.root.position.y, obj.root.position.z],
+          quat: [obj.root.quaternion.x, obj.root.quaternion.y, obj.root.quaternion.z, obj.root.quaternion.w],
+          scale: [obj.root.scale.x, obj.root.scale.y, obj.root.scale.z],
+          bones: Object.fromEntries(Object.keys(obj.bones).map(n => {
+            const b = obj.bones[n].obj;
+            return [n, {
+              q: [b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w],
+              p: [b.position.x, b.position.y, b.position.z]
+            }];
+          })),
+          meshes: (obj.meshes || []).map(m => {
+            const mats = getMats(m.mesh);
+            return {
+              name: m.name,
+              visible: m.mesh.visible,
+              color: mats[0]?.color ? [mats[0].color.r, mats[0].color.g, mats[0].color.b] : null,
+              textureAssetId: m.mesh.userData.textureAssetId || null
+            };
+          }),
+          faceDecal: serializeFace(obj),
+          attachments: (obj.attachments || []).map(a => {
+        const entry = { name: a.name, assetId: a.assetId || null };
+        if (a.mesh) entry.transform = {
+          p: [a.mesh.position.x, a.mesh.position.y, a.mesh.position.z],
+          q: [a.mesh.quaternion.x, a.mesh.quaternion.y, a.mesh.quaternion.z, a.mesh.quaternion.w],
+          s: [a.mesh.scale.x, a.mesh.scale.y, a.mesh.scale.z]
+        };
+        if (!a.assetId && a.mesh) {
+          try { entry.inline = serializeAttachmentMesh(a.mesh, obj.root); }
+          catch (e) { console.warn('Attachment serialize failed:', e); }
+        }
+        return entry;
+      })
+        },
+        assetIds: [...usedAssetIds]
+    };
+
+    const zip = new JSZip();
+    zip.file('renderblox.json', JSON.stringify(manifest, null, 2));
+
+    const objectsFolder = zip.folder('objects');
+    for (const id of manifest.assetIds) {
+      const asset = assetStore.get(id);
+      if (!asset) continue;
+      const ext = asset.type === 'obj' ? 'obj' : (asset.type === 'texture' ? 'png' : 'glb');
+      const safeName = (asset.name || 'asset').replace(/[^a-zA-Z0-9._-]/g, '_');
+      objectsFolder.file(`${id}_${safeName}`, asset.bytes);
+    }
+
+    const blob = await zip.generateAsync({
+      type: 'blob',
+      compression: 'DEFLATE',
+      compressionOptions: { level: 6 }
+    });
+
+    const defaultName = filename || `renderblox_character_${Date.now()}.rx6`;
+    triggerDownload(blob, defaultName);
+    return { blob, filename: defaultName, manifest };
+}
+
+export async function loadRx6(file) {
+  const { sceneState, buildCharacter } = await import('./scene.js');
+  const buffer = await file.arrayBuffer();
+  const format = await detectRdbxFormat(buffer);
+  if (format !== 'zip') {
+    throw new Error('Not a valid .rx6 file (expected a zip archive)');
+  }
+  const zip = await JSZip.loadAsync(buffer);
+  const manifestFile = zip.file('renderblox.json');
+  if (!manifestFile) throw new Error('Zip is missing renderblox.json');
+  const manifestText = await manifestFile.async('text');
+  const manifest = JSON.parse(manifestText);
+  if (manifest.format !== 'RX6') throw new Error('Not an .rx6 file (wrong manifest format)');
+  if (!manifest.character) throw new Error('.rx6 manifest is missing the character block');
+
+  // Extract assets
+  assetStore.clear();
+  if (manifest.assetIds) {
+    for (const id of manifest.assetIds) {
+      const pathPrefix = `objects/${id}_`;
+      const fileKey = Object.keys(zip.files).find(
+        k => k.startsWith(pathPrefix) && !zip.files[k].dir
+      );
+      if (!fileKey) continue;
+      const bytes = await zip.files[fileKey].async('arraybuffer');
+      const name = fileKey.substring(pathPrefix.length);
+      const type = /\.obj$/i.test(name) ? 'obj'
+      : /\.(png|jpg|jpeg|webp)$/i.test(name) ? 'texture'
+      : 'glb';
+      assetStore.map[id] = { type, name, bytes };
+    }
+    const maxId = manifest.assetIds.reduce((m, k) => {
+      const n = parseInt(k.replace('asset_', ''));
+      return isNaN(n) ? m : Math.max(m, n);
+    }, 0);
+    assetStore.nextId = maxId + 1;
+  }
+
+  // Build the character from the correct template
+  const cd = manifest.character;
+  const gender = cd.gender || 'male';
+  let template = null;
+
+  if (gender === 'female') {
+    await waitForR6GirlTemplate();
+    template = window.__renderbloxSceneGirlTemplate;
+    if (!template) throw new Error('Female R6 template (r6-girl.glb) not loaded');
+  } else {
+    await waitForR6Template();
+    template = sceneState.getR6Template?.();
+    if (!template) throw new Error('Male R6 template not loaded');
+  }
+
+  const THREE = await import('three');
+  const { clone: skeletonClone } = await import('three/addons/utils/SkeletonUtils.js');
+  const root = skeletonClone(template.scene);
+  const obj = buildCharacter(root, cd.name || 'Character');
+  obj.gender = gender;
+  obj.builtin = true;
+  if ((cd.hiddenParts && cd.hiddenParts.length) || (cd.partColors && Object.keys(cd.partColors).length)) {
+    obj.hiddenParts = cd.hiddenParts || [];
+    obj.partColors = cd.partColors || {};
+    import('./scene.js').then(m => m.applyCharacterAppearance(obj, obj.hiddenParts, obj.partColors));
+  }
+  if (cd.hiddenParts && cd.hiddenParts.length) {
+    obj.hiddenParts = cd.hiddenParts;
+    
+  }
+  if (cd.partColors && Object.keys(cd.partColors).length > 0) {
+    obj.partColors = cd.partColors;
+    
+  }
+  if (cd.hiddenParts && cd.hiddenParts.length) {
+    obj.hiddenParts = cd.hiddenParts;
+    
+  }
+
+  // Restore transform + pose
+  obj.root.position.set(...(cd.position || [0, 0, 0]));
+  if (cd.quat) obj.root.quaternion.set(...cd.quat);
+  if (Array.isArray(cd.scale)) obj.root.scale.set(...cd.scale);
+  obj.currentAction = cd.currentAction || 'idle';
+  obj.__manualPose = true;
+
+  if (cd.bones) {
+    for (const n in cd.bones) {
+      const e = obj.bones[n];
+      if (!e) continue;
+      const d = cd.bones[n];
+      e.obj.quaternion.set(d.q[0], d.q[1], d.q[2], d.q[3]);
+      e.obj.position.set(d.p[0], d.p[1], d.p[2]);
+    }
+  }
+
+  // Restore mesh colors + textures
+  if (cd.meshes && obj.meshes) {
+    for (let i = 0; i < cd.meshes.length && i < obj.meshes.length; i++) {
+      const ms = cd.meshes[i];
+      const entry = obj.meshes[i];
+      entry.mesh.visible = ms.visible !== false;
+      if (ms.color) {
+        const col = new THREE.Color(ms.color[0], ms.color[1], ms.color[2]);
+        getMats(entry.mesh).forEach(mat => { if (mat.color) mat.color.copy(col); });
+      }
+      if (ms.textureAssetId) {
+        const ta = assetStore.get(ms.textureAssetId);
+        if (ta) {
+          const tex = await loadTextureFromBytes(ta.bytes);
+          if (tex) {
+            getMats(entry.mesh).forEach(mat => { mat.map = tex; mat.needsUpdate = true; });
+            entry.mesh.userData.textureAssetId = ms.textureAssetId;
+          }
+        }
+      }
+    }
+  }
+
+  // Restore face
+  try { await restoreFace(obj, cd.faceDecal); } catch (e) { console.warn('face restore failed', e); }
+
+  // Restore attachments
+  for (const attData of (cd.attachments || [])) {
+    if (!attData.assetId && attData.inline) {
+        try {
+          const _T = await import('three');
+          const _root = deserializeAttachmentMesh(_T, attData.inline);
+          if (_root) {
+            const _hb = (sceneState.findHeadBone && sceneState.findHeadBone(obj))
+              || (obj.bones && obj.bones['Head_01'] && obj.bones['Head_01'].obj)
+              || null;
+            if (_hb) { _hb.add(_root); } // keep the saved head-local transform
+            else { obj.root.add(_root); _root.position.set(0, 3, 0); }
+            obj.attachments.push({ name: attData.name, mesh: _root, assetId: null });
+          }
+        } catch (e) { console.warn('inline attachment rebuild failed:', e); }
+        continue;
+      }
+      if (!attData.assetId) continue;
+    const a = assetStore.get(attData.assetId);
+    if (!a) continue;
+    const attRoot = a.type === 'obj'
+    ? await loadOBJRootFromBytes(a.bytes)
+    : await loadGLTFRootFromBytes(a.bytes);
+    if (!attRoot) continue;
+    const box = new THREE.Box3().setFromObject(attRoot);
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    if (maxDim > 0.001) attRoot.scale.setScalar(1.5 / maxDim);
+    attRoot.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    // Prefer head bone; fall back to root
+    const hb = (sceneState.findHeadBone && sceneState.findHeadBone(obj))
+      || obj.bones?.['Head_01']?.obj
+      || null;
+    if (hb) { hb.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          }
+          if (attData.transform) _applySavedTransform(attRoot, attData.transform);
+          else _placeOnHead(hb, attRoot); }
+    else { obj.root.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          } }
+    obj.attachments.push({ name: attData.name, mesh: attRoot, assetId: attData.assetId });
+  }
+
+  return { obj, manifest };
+}
+// ------------------------------------------------------------
+// Load a .rx6 INTO an existing scene (don't clear other objects).
+// Used by editor.html's File → Import .rx6.
+// Returns the new character object.
+// ------------------------------------------------------------
+export async function loadRx6IntoScene(file, opts = {}) {
+  const { sceneState, buildCharacter } = await import('./scene.js');
+  const THREE = await import('three');
+  const { clone: skeletonClone } = await import('three/addons/utils/SkeletonUtils.js');
+
+  const buffer = await file.arrayBuffer();
+  const format = await detectRdbxFormat(buffer);
+  if (format !== 'zip') throw new Error('Not a valid .rx6 file (expected a zip archive)');
+
+  const zip = await JSZip.loadAsync(buffer);
+  const manifestFile = zip.file('renderblox.json');
+  if (!manifestFile) throw new Error('.rx6 zip is missing renderblox.json');
+  const manifest = JSON.parse(await manifestFile.async('text'));
+  if (manifest.format !== 'RX6') throw new Error('Not an .rx6 file (wrong manifest format)');
+  if (!manifest.character) throw new Error('.rx6 manifest is missing the character block');
+
+  // Extract assets into the shared asset store — but remember which
+  // IDs were there before, so we don't clobber an existing scene's assets.
+  const preExistingIds = new Set(Object.keys(assetStore.map));
+  const rx6AssetIds = manifest.assetIds || [];
+  for (const id of rx6AssetIds) {
+    const pathPrefix = `objects/${id}_`;
+    const fileKey = Object.keys(zip.files).find(
+      k => k.startsWith(pathPrefix) && !zip.files[k].dir
+    );
+    if (!fileKey) continue;
+    const bytes = await zip.files[fileKey].async('arraybuffer');
+    const name = fileKey.substring(pathPrefix.length);
+    const type = /\.obj$/i.test(name) ? 'obj'
+    : /\.(png|jpg|jpeg|webp)$/i.test(name) ? 'texture'
+    : 'glb';
+    // If the ID already exists (unlikely but possible), remap it
+    let finalId = id;
+    if (preExistingIds.has(id)) {
+      finalId = 'asset_' + (assetStore.nextId++);
+    }
+    assetStore.map[finalId] = { type, name, bytes };
+    // Update the manifest to use the remapped ID
+    rx6AssetIds[rx6AssetIds.indexOf(id)] = finalId;
+    if (manifest.character.attachments) {
+      manifest.character.attachments.forEach(a => {
+        if (a.assetId === id) a.assetId = finalId;
+      });
+    }
+    if (manifest.character.faceDecal && manifest.character.faceDecal.textureAssetId === id) {
+      manifest.character.faceDecal.textureAssetId = finalId;
+    }
+    if (manifest.character.faceDecal && manifest.character.faceDecal.faceKey === 'asset:' + id) {
+      manifest.character.faceDecal.faceKey = 'asset:' + finalId;
+    }
+    if (manifest.character.meshes) {
+      manifest.character.meshes.forEach(m => {
+        if (m.textureAssetId === id) m.textureAssetId = finalId;
+      });
+    }
+  }
+  // Update nextId if the manifest's IDs were higher
+  const maxId = rx6AssetIds.reduce((m, k) => {
+    const n = parseInt(String(k).replace('asset_', ''));
+    return isNaN(n) ? m : Math.max(m, n);
+  }, 0);
+  if (maxId >= assetStore.nextId) assetStore.nextId = maxId + 1;
+
+  // Build character from template
+  const cd = manifest.character;
+  const gender = cd.gender || 'male';
+  let template = null;
+
+  if (gender === 'female') {
+    await waitForR6GirlTemplate();
+    template = window.__renderbloxSceneGirlTemplate;
+    if (!template) throw new Error('Female R6 template (r6-girl.glb) not loaded');
+  } else {
+    await waitForR6Template();
+    template = sceneState.getR6Template?.();
+    if (!template) throw new Error('Male R6 template not loaded');
+  }
+
+  const root = skeletonClone(template.scene);
+  const obj = buildCharacter(root, cd.name || 'Character');
+  obj.gender = gender;
+  obj.builtin = true;
+  if ((cd.hiddenParts && cd.hiddenParts.length) || (cd.partColors && Object.keys(cd.partColors).length)) {
+    obj.hiddenParts = cd.hiddenParts || [];
+    obj.partColors = cd.partColors || {};
+    import('./scene.js').then(m => m.applyCharacterAppearance(obj, obj.hiddenParts, obj.partColors));
+  }
+  if (cd.hiddenParts && cd.hiddenParts.length) {
+    obj.hiddenParts = cd.hiddenParts;
+    
+  }
+  if (cd.partColors && Object.keys(cd.partColors).length > 0) {
+    obj.partColors = cd.partColors;
+    
+  }
+  if (cd.hiddenParts && cd.hiddenParts.length) {
+    obj.hiddenParts = cd.hiddenParts;
+    
+  }
+
+  // Place it beside existing objects so it doesn't overlap
+  const offsetX = opts.keepPlacement ? 0 : (sceneState.objects.length - 1) * 3;
+  const basePos = cd.position || [0, 0, 0];
+  obj.root.position.set(basePos[0] + offsetX, basePos[1], basePos[2]);
+  if (cd.quat) obj.root.quaternion.set(...cd.quat);
+  if (Array.isArray(cd.scale)) obj.root.scale.set(...cd.scale);
+
+  obj.currentAction = cd.currentAction || 'idle';
+  obj.__manualPose = true;
+
+  // Keep the ORIGINAL .rx6 bytes so a scene save can store the file as-is
+  {
+    let nm = String(opts.name || file.name || 'character.rx6').replace(/[^a-zA-Z0-9._-]/g, '_');
+    if (!/\.rx6$/i.test(nm)) nm += '.rx6';
+    if (opts.rx6AssetId) {
+      assetStore.map[opts.rx6AssetId] = { type: 'rx6', name: nm, bytes: buffer };
+      obj.rx6AssetId = opts.rx6AssetId;
+    } else {
+      obj.rx6AssetId = assetStore.register('rx6', nm, buffer);
+    }
+  }
+
+  // Restore bones
+  if (cd.bones) {
+    for (const n in cd.bones) {
+      const e = obj.bones[n];
+      if (!e) continue;
+      const d = cd.bones[n];
+      e.obj.quaternion.set(d.q[0], d.q[1], d.q[2], d.q[3]);
+      e.obj.position.set(d.p[0], d.p[1], d.p[2]);
+    }
+  }
+
+  // Restore mesh colors + textures
+  if (cd.meshes && obj.meshes) {
+    for (let i = 0; i < cd.meshes.length && i < obj.meshes.length; i++) {
+      const ms = cd.meshes[i];
+      const entry = obj.meshes[i];
+      entry.mesh.visible = ms.visible !== false;
+      if (ms.color) {
+        const col = new THREE.Color(ms.color[0], ms.color[1], ms.color[2]);
+        getMats(entry.mesh).forEach(mat => { if (mat.color) mat.color.copy(col); });
+      }
+      if (ms.textureAssetId) {
+        const ta = assetStore.get(ms.textureAssetId);
+        if (ta) {
+          const tex = await loadTextureFromBytes(ta.bytes);
+          if (tex) {
+            getMats(entry.mesh).forEach(mat => { mat.map = tex; mat.needsUpdate = true; });
+            entry.mesh.userData.textureAssetId = ms.textureAssetId;
+          }
+        }
+      }
+    }
+  }
+
+  // Restore face
+  try { await restoreFace(obj, cd.faceDecal); } catch (e) { console.warn('face restore failed', e); }
+
+  // Restore attachments
+  for (const attData of (cd.attachments || [])) {
+    if (!attData.assetId && attData.inline) {
+        try {
+          const _T = await import('three');
+          const _root = deserializeAttachmentMesh(_T, attData.inline);
+          if (_root) {
+            const _hb = (sceneState.findHeadBone && sceneState.findHeadBone(obj))
+              || (obj.bones && obj.bones['Head_01'] && obj.bones['Head_01'].obj)
+              || null;
+            if (_hb) { _hb.add(_root); } // keep the saved head-local transform
+            else { obj.root.add(_root); _root.position.set(0, 3, 0); }
+            obj.attachments.push({ name: attData.name, mesh: _root, assetId: null });
+          }
+        } catch (e) { console.warn('inline attachment rebuild failed:', e); }
+        continue;
+      }
+      if (!attData.assetId) continue;
+    const a = assetStore.get(attData.assetId);
+    if (!a) continue;
+    const attRoot = a.type === 'obj'
+    ? await loadOBJRootFromBytes(a.bytes)
+    : await loadGLTFRootFromBytes(a.bytes);
+    if (!attRoot) continue;
+    const box = new THREE.Box3().setFromObject(attRoot);
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z);
+    if (maxDim > 0.001) attRoot.scale.setScalar(1.5 / maxDim);
+    attRoot.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
+    // Prefer head bone; fall back to root
+    const hb = (sceneState.findHeadBone && sceneState.findHeadBone(obj))
+      || obj.bones?.['Head_01']?.obj
+      || null;
+    if (hb) { hb.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          }
+          if (attData.transform) _applySavedTransform(attRoot, attData.transform);
+          else _placeOnHead(hb, attRoot); }
+    else { obj.root.add(attRoot);
+          // Clamp attachment transform to head-local space
+          if (attRoot.position.y > 2 || attRoot.position.y < -1) {
+            attRoot.position.set(0, 1.55, 0);
+          }
+          if (Math.abs(attRoot.scale.x) > 3 || Math.abs(attRoot.scale.z) > 3) {
+            attRoot.scale.set(0.55, 0.55, 0.55);
+          } }
+    obj.attachments.push({ name: attData.name, mesh: attRoot, assetId: attData.assetId });
+  }
+
+  return obj;
+}

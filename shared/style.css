@@ -1,0 +1,80 @@
+/* ============================================================
+   RenderBlox shared theme
+   Used by index.html, deditor.html, chareditor.html
+   ============================================================ */
+
+:root{
+  --bg:#eef0f4; --panel:#ffffff; --panel-2:#f5f6f8; --panel-3:#e4e7ec; --panel-4:#d6dae0;
+  --border:#d0d4da; --text:#1a1d23; --dim:#6b7280; --dim-2:#9099a8;
+  --accent:#ff6b35; --accent-2:#3b82f6; --hover:#e8ebef;
+  --key:#ffb24a; --playhead:#ff3b52; --sel:#dbeafe; --sel-border:#3b82f6;
+  --green:#22c55e; --red:#ef4444; --cam:#a855f7; --bone:#ffcc44;
+  --menubar:#f0f1f3; --menubar-text:#1a1d23; --menubar-hover:#d6dae0;
+  --shadow:0 1px 3px rgba(0,0,0,.08); --shadow-lg:0 8px 24px rgba(0,0,0,.12);
+  --shadow-menu:0 6px 20px rgba(0,0,0,.18);
+}
+body.dark{
+  --bg:#181a1d; --panel:#25282c; --panel-2:#2e3237; --panel-3:#1f2225; --panel-4:#15171a;
+  --border:#111315; --text:#d8dde3; --dim:#7a828e; --dim-2:#556;
+  --accent:#ff8a3d; --accent-2:#5aa9ff; --hover:#353a40;
+  --sel:#3a6fa8; --sel-border:#5aa9ff;
+  --menubar:#1f2225; --menubar-text:#d8dde3; --menubar-hover:#353a40;
+  --shadow:0 1px 3px rgba(0,0,0,.4); --shadow-lg:0 8px 24px rgba(0,0,0,.6);
+  --shadow-menu:0 6px 20px rgba(0,0,0,.55);
+}
+
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:var(--bg);color:var(--text);
+  font-family:'Inter','Segoe UI',system-ui,sans-serif;font-size:13px;
+  transition:background .2s,color .2s}
+
+body{user-select:none}
+body.selecting{user-select:text}
+
+/* Buttons */
+.btn{padding:8px 14px;border:1px solid var(--border);background:var(--panel);
+  color:var(--text);border-radius:8px;font-family:inherit;font-size:12px;
+  font-weight:600;cursor:pointer;transition:all .12s;
+  display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.btn:hover{background:var(--hover);border-color:var(--accent)}
+.btn:active{transform:scale(.97)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn.primary{background:var(--accent-2);color:#fff;border-color:var(--accent-2)}
+.btn.primary:hover{filter:brightness(1.08);background:var(--accent-2)}
+.btn.green{background:var(--green);color:#fff;border-color:var(--green)}
+.btn.green:hover{filter:brightness(1.08);background:var(--green)}
+.btn.red{background:var(--red);color:#fff;border-color:var(--red)}
+.btn.red:hover{filter:brightness(1.08);background:var(--red)}
+.btn.small{padding:5px 10px;font-size:11px}
+
+/* Toast */
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);
+  padding:12px 22px;background:var(--panel);border:1px solid var(--border);
+  border-radius:10px;color:var(--text);font-size:12px;font-weight:600;
+  opacity:0;transition:all .25s;pointer-events:none;
+  box-shadow:var(--shadow-lg);z-index:9999}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* Card layout (used by landing page) */
+.card-grid{display:grid;gap:20px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;
+  padding:28px;box-shadow:var(--shadow);cursor:pointer;
+  transition:all .2s;text-decoration:none;color:var(--text);
+  display:flex;flex-direction:column;gap:12px}
+.card:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:var(--accent-2)}
+.card .em{font-size:44px;line-height:1}
+.card h2{font-size:20px;font-weight:800;letter-spacing:-.02em}
+.card p{font-size:13px;color:var(--dim);line-height:1.6}
+.card .badge{align-self:flex-start;margin-top:auto;padding:4px 10px;
+  background:var(--panel-3);border-radius:999px;font-size:10px;
+  font-weight:700;color:var(--dim);letter-spacing:.05em;text-transform:uppercase}
+
+/* Modal */
+.backdrop{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
+  display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.backdrop.show{display:flex}
+.modal{background:var(--panel);border-radius:14px;padding:26px 28px;
+  box-shadow:var(--shadow-lg);min-width:360px;max-width:90vw}
+.modal h3{font-size:15px;font-weight:800;margin-bottom:14px}
+.modal .btns{display:flex;gap:10px;justify-content:flex-end;margin-top:18px}
